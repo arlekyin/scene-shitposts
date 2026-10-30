@@ -1,14 +1,26 @@
 {
   "id": "scene-shitposts",
   "title": "Scene Shitposts",
-  "description": "Owlbear-style freeform image, screenshot, and MP4/WebM GIF pasting directly onto the scene canvas.",
-  "version": "2.0.0",
+  "description": "Owlbear-style freeform image, screenshot, GIF and MP4/WebM pasting directly onto the scene canvas.",
+  "version": "2.1.0",
+  "authors": [
+    {
+      "name": "arlekyin",
+      "url": "https://github.com/arlekyin"
+    }
+  ],
   "compatibility": {
-    "minimum": "12",
+    "minimum": "13",
     "verified": "14"
   },
   "esmodules": [
     "scripts/main.js"
   ],
-  "socket": true
+  "styles": [
+    "styles/shitposts.css"
+  ],
+  "socket": true,
+  "url": "https://github.com/arlekyin/scene-shitposts",
+  "manifest": "https://github.com/arlekyin/scene-shitposts/releases/latest/download/module.json",
+  "download": "https://github.com/arlekyin/scene-shitposts/releases/download/v2.1.0/module.zip"
 }
