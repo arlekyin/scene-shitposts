@@ -1,0 +1,24 @@
+#shitpost-ui .window-content {
+  background: rgba(20, 20, 20, 0.9);
+  color: #fff;
+  padding: 10px;
+}
+
+.shitpost-form-group {
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.shitpost-form-group input {
+  background: #333;
+  color: #fff;
+  border: 1px solid #555;
+  padding: 5px;
+}
+
+.shitpost-buttons {
+  display: flex;
+  gap: 5px;
+}

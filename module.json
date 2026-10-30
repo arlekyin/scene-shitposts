@@ -1,0 +1,14 @@
+{
+  "id": "scene-shitposts",
+  "title": "Scene Shitposts",
+  "description": "Owlbear-style freeform image, screenshot, and MP4/WebM GIF pasting directly onto the scene canvas.",
+  "version": "2.0.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "14"
+  },
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "socket": true
+}

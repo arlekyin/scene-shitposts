@@ -1,0 +1,12 @@
+<form class="shitpost-form">
+    <div class="shitpost-form-group">
+        <label><i class="fas fa-link"></i> Ссылка на картинку или MP4/WebM:</label>
+        <input type="text" id="shitpost-url" placeholder="https://.../cat.mp4" />
+    </div>
+    <div class="shitpost-buttons">
+        <button type="button" id="spawn-shitpost"><i class="fas fa-plus"></i> Закинуть</button>
+        {{#if isGM}}
+        <button type="button" id="clear-shitposts" style="background: #8b0000; color: white;"><i class="fas fa-trash"></i> Очистить всё</button>
+        {{/if}}
+    </div>
+</form>
