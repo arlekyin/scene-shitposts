@@ -16,6 +16,9 @@
   "esmodules": [
     "scripts/main.js"
   ],
+  "styles": [
+    "styles/shitposts.css"
+  ],
   "socket": true,
   "url": "https://github.com/arlekyin/scene-shitposts",
   "manifest": "https://github.com/arlekyin/scene-shitposts/releases/latest/download/module.json",

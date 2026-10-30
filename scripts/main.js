@@ -20,12 +20,16 @@ const MIME_EXTENSIONS = {
 };
 // Не сохраняем на сервер файлы крупнее этого размера, оставляем внешнюю ссылку
 const MAX_CACHE_BYTES = 30 * 1024 * 1024;
-// Публичные CORS-прокси, используются по очереди, если хостинг не отдаёт CORS-заголовки
-const CORS_PROXIES = [
-  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
-];
+// Максимальная сторона текстуры: при загрузке картинки и кадры анимаций уменьшаются до неё
+const MAX_STATIC_SIZE = 2048;
+const MAX_ANIMATION_SIZE = 640;
+// Сколько держать файл в памяти после того, как его перестали показывать (например, при переходе между сценами)
+const MEDIA_RELEASE_DELAY = 10_000;
+// Как часто проверять, видны ли анимации на экране
+const MEDIA_WATCH_INTERVAL = 250;
+const PROXY_TIMEOUT = 15_000;
+// Ошибка загрузки свежего поста показывается автору, старые посты не спамят уведомлениями
+const FRESH_POST_MS = 60_000;
 
 /**
  * Обёртки над API, которые переехали между версиями Foundry (v12 — глобалы, v13+ — неймспейс foundry.*)
@@ -37,8 +41,39 @@ const Compat = {
   loadTexture(src) {
     const loader = foundry.canvas?.loadTexture ?? globalThis.loadTexture;
     return loader(src);
+  },
+  /**
+   * Возвращает объект обновления, который удаляет поле документа по пути path.
+   * v14 — оператор ForcedDeletion, v13 — синтаксис "-=key"
+   */
+  deletion(path) {
+    const ForcedDeletion = foundry.data?.operators?.ForcedDeletion;
+    if (ForcedDeletion) return { [path]: new ForcedDeletion() };
+    const dot = path.lastIndexOf(".");
+    return { [`${path.slice(0, dot)}.-=${path.slice(dot + 1)}`]: null };
   }
 };
+
+/**
+ * Файл нельзя скачать в браузере (хостинг без CORS и нет прокси). Такой пост показывается HTML-элементом поверх холста
+ */
+class BlockedMediaError extends Error {}
+
+/**
+ * Адрес CORS-прокси из настроек мира для ссылки url или null, если прокси не настроен
+ */
+function getProxyUrl(url) {
+  let template = "";
+  try {
+    template = String(game.settings.get(MODULE_ID, "corsProxy") ?? "").trim();
+  } catch {
+    // Настройки ещё не зарегистрированы
+  }
+  if (!template) return null;
+  const encoded = encodeURIComponent(url);
+  if (template.includes("{url}")) return template.replace("{url}", encoded);
+  return `${template}${template.includes("?") ? "&" : "?"}url=${encoded}`;
+}
 
 /**
  * Определяет реальный формат файла по первым байтам, не доверяя расширению и Content-Type
@@ -134,6 +169,15 @@ class MediaUrlResolver {
     } catch {
       // Относительный путь (файл, загруженный в мир) — оставляем как есть
       return url;
+    }
+
+    // Ссылка на файл этого же сервера Foundry: храним относительный путь, иначе игроки,
+    // которые подключаются по другому адресу (IP, домен), получат localhost
+    if (parsed.origin === globalThis.window?.location?.origin) {
+      let path = parsed.pathname.replace(/^\/+/, "");
+      const prefix = globalThis.game?.data?.options?.routePrefix;
+      if (prefix && path.startsWith(`${prefix}/`)) path = path.slice(prefix.length + 1);
+      return path + parsed.search;
     }
     const host = parsed.hostname.toLowerCase();
 
@@ -272,8 +316,10 @@ class MediaUrlResolver {
 
     const promise = this._downloadBuffer(src);
     this._bufferCache.set(src, promise);
+    // Буфер нужен, чтобы resolve() и загрузка на холст не качали файл дважды; дольше держать его незачем,
+    // повторные заходы на сцену обслуживает локальный кеш
     promise.then(
-      () => setTimeout(() => this._bufferCache.delete(src), 60_000),
+      () => setTimeout(() => this._bufferCache.delete(src), MEDIA_RELEASE_DELAY),
       () => this._bufferCache.delete(src)
     );
     return promise;
@@ -285,29 +331,631 @@ class MediaUrlResolver {
       contentType: res.headers.get("content-type") || ""
     });
 
+    // Файлы щитпостов мира сначала ищем в локальном кеше браузера
+    const cacheKey = PersistentCache.keyFor(src);
+    if (cacheKey) {
+      const hit = await PersistentCache.get(cacheKey);
+      if (hit) return hit;
+    }
+
     // Попытка 1: Прямой запрос (работает для файлов мира, cdn.discordapp.com, media.giphy.com и других хостингов с CORS)
     try {
       const res = await fetch(src, { mode: "cors", credentials: this.isRemote(src) ? "omit" : "same-origin" });
-      if (res.ok) return await read(res);
+      if (res.ok) {
+        const result = await read(res);
+        if (cacheKey) PersistentCache.put(cacheKey, result.buffer, result.contentType);
+        return result;
+      }
     } catch {
-      // Переходим к запасному прокси
+      // Переходим к прокси
     }
 
-    // Попытка 2: Через резервные CORS-прокси (правильно кодируя URL со всеми амперсандами)
-    if (this.isRemote(src)) {
-      for (const makeProxyUrl of CORS_PROXIES) {
-        try {
-          const res = await fetch(makeProxyUrl(src), { credentials: "omit" });
-          if (res.ok) return await read(res);
-        } catch {
-          // Пробуем следующий прокси
-        }
+    // Попытка 2: Через CORS-прокси из настроек мира, если он задан
+    const proxyUrl = this.isRemote(src) ? getProxyUrl(src) : null;
+    if (proxyUrl) {
+      try {
+        const res = await fetch(proxyUrl, { credentials: "omit", signal: AbortSignal.timeout(PROXY_TIMEOUT) });
+        if (res.ok) return await read(res);
+      } catch {
+        // Прокси недоступен
       }
     }
 
     throw new Error(`Не удалось скачать ресурс: ${src}`);
   }
 }
+
+/**
+ * Загружает файл и превращает его в текстуру PIXI. Возвращает объект media:
+ * { texture, width, height, setActive(active), destroy() }
+ */
+class MediaLoader {
+  static async load(src, type) {
+    const remote = MediaUrlResolver.isRemote(src);
+
+    // Видео из папки щитпостов берём через локальный кеш целиком, остальные видео браузер подгружает потоком
+    if (type === "video" && PersistentCache.keyFor(src)) {
+      try {
+        const res = await MediaUrlResolver.fetchMediaBuffer(src);
+        const mime = sniffMedia(res.buffer)?.mime || res.contentType.split(";")[0].trim() || "video/mp4";
+        return await this._videoFromBuffer(res.buffer, mime);
+      } catch (err) {
+        console.warn("Scene Shitposts | Видео из кеша не открылось, грузим напрямую:", src, err);
+      }
+    }
+
+    if (type === "video") {
+      try {
+        return await this._video(src, remote);
+      } catch (err) {
+        if (!remote) throw err;
+        // Хостинг без CORS: WebGL не может взять кадры такого видео, поэтому скачиваем его целиком и играем из Blob
+        let res;
+        try {
+          res = await MediaUrlResolver.fetchMediaBuffer(src);
+        } catch {
+          throw new BlockedMediaError(src);
+        }
+        const mime = sniffMedia(res.buffer)?.mime || res.contentType.split(";")[0].trim() || "video/mp4";
+        return this._videoFromBuffer(res.buffer, mime);
+      }
+    }
+
+    let res;
+    try {
+      res = await MediaUrlResolver.fetchMediaBuffer(src);
+    } catch {
+      if (remote) throw new BlockedMediaError(src);
+      return this._viaFoundry(src);
+    }
+    const mime = sniffMedia(res.buffer)?.mime || res.contentType.split(";")[0].trim() || "image/png";
+
+    // Ссылка с расширением .gif, внутри которой на самом деле MP4/WebM
+    if (mime.startsWith("video/")) return this._videoFromBuffer(res.buffer, mime);
+    if (mime === "text/html") throw new Error(`По ссылке веб-страница, а не файл: ${src}`);
+
+    try {
+      const animated = await this._animated(res.buffer, mime);
+      if (animated) return animated;
+    } catch (err) {
+      console.warn("Scene Shitposts | ImageDecoder не смог декодировать анимацию, открываем как статику:", src, err);
+    }
+    return this._static(res.buffer, mime);
+  }
+
+  static async _viaFoundry(src) {
+    const texture = await Compat.loadTexture(src);
+    if (!texture) throw new Error(`Foundry не смог загрузить текстуру: ${src}`);
+    // Текстуры из кеша Foundry общие, их не уничтожаем
+    return { texture, width: texture.width, height: texture.height, setActive() {}, destroy() {} };
+  }
+
+  static async _static(buffer, mime) {
+    const blob = new Blob([buffer], { type: mime });
+    let source;
+    let width;
+    let height;
+
+    if (mime === "image/svg+xml") {
+      // createImageBitmap не принимает SVG
+      const url = URL.createObjectURL(blob);
+      try {
+        source = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error("SVG не загрузился"));
+          image.src = url;
+        });
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      width = source.naturalWidth || 300;
+      height = source.naturalHeight || 300;
+    } else {
+      // createImageBitmap декодирует картинку сразу, в отличие от img.decode() не ждёт отрисовки страницы
+      source = await createImageBitmap(blob);
+      width = source.width;
+      height = source.height;
+      const scale = Math.min(1, MAX_STATIC_SIZE / Math.max(width, height));
+      if (scale < 1) {
+        source.close();
+        source = await createImageBitmap(blob, {
+          resizeWidth: Math.max(1, Math.round(width * scale)),
+          resizeHeight: Math.max(1, Math.round(height * scale)),
+          resizeQuality: "high"
+        });
+      }
+    }
+
+    const texture = PIXI.Texture.from(source);
+    return {
+      texture,
+      width,
+      height,
+      setActive() {},
+      destroy() {
+        texture.destroy(true);
+        source.close?.();
+      }
+    };
+  }
+
+  /**
+   * Анимированный GIF / WebP / APNG / AVIF. Кадры декодируются по одному и сразу превращаются
+   * в уменьшенный ImageBitmap (это делается вне главного потока), который загружается в текстуру напрямую.
+   * Возвращает null, если файл не анимирован или браузер не умеет его декодировать.
+   */
+  static async _animated(buffer, mime) {
+    if (!ANIMATABLE_MIMES.has(mime) || typeof ImageDecoder === "undefined") return null;
+    if (!(await ImageDecoder.isTypeSupported(mime))) return null;
+
+    const decoder = new ImageDecoder({ data: buffer, type: mime });
+    try {
+      await decoder.tracks.ready;
+      // Количество кадров окончательное только после разбора всего файла
+      await decoder.completed;
+      const frameCount = decoder.tracks.selectedTrack?.frameCount ?? 0;
+      if (frameCount < 2) {
+        decoder.close();
+        return null;
+      }
+
+      const first = (await decoder.decode({ frameIndex: 0 })).image;
+      const width = first.displayWidth;
+      const height = first.displayHeight;
+      const scale = Math.min(1, MAX_ANIMATION_SIZE / Math.max(width, height));
+      const resize = scale < 1
+        ? {
+          resizeWidth: Math.max(1, Math.round(width * scale)),
+          resizeHeight: Math.max(1, Math.round(height * scale)),
+          resizeQuality: "medium"
+        }
+        : {};
+      // ImageDecoder отдаёт уже собранные полные кадры, поэтому каждый кадр просто заменяет предыдущий
+      const toBitmap = async (frame) => {
+        try {
+          return await createImageBitmap(frame, resize);
+        } finally {
+          frame.close();
+        }
+      };
+
+      const texture = PIXI.Texture.from(await toBitmap(first));
+      const resource = texture.baseTexture.resource;
+      let frameIndex = 0;
+      let timer = null;
+      let running = false;
+      let active = false;
+      let closed = false;
+
+      const schedule = (delay) => {
+        if (timer || running || !active || closed) return;
+        timer = setTimeout(tick, delay);
+      };
+      const tick = async () => {
+        timer = null;
+        if (!active || closed) return;
+        running = true;
+        const started = performance.now();
+        let delay = 100;
+        try {
+          frameIndex = (frameIndex + 1) % frameCount;
+          const frame = (await decoder.decode({ frameIndex })).image;
+          delay = frameDelay(frame);
+          const bitmap = await toBitmap(frame);
+          if (closed) {
+            bitmap.close();
+            return;
+          }
+          const previous = resource.source;
+          resource.source = bitmap;
+          texture.baseTexture.update();
+          previous?.close?.();
+        } catch (err) {
+          if (!closed) console.warn("Scene Shitposts | Ошибка декодирования кадра:", err);
+        } finally {
+          running = false;
+        }
+        schedule(Math.max(0, delay - (performance.now() - started)));
+      };
+
+      return {
+        texture,
+        width,
+        height,
+        // Анимация крутится, только пока её видно на экране
+        setActive(value) {
+          active = value;
+          if (!active) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          schedule(0);
+        },
+        destroy() {
+          closed = true;
+          clearTimeout(timer);
+          try {
+            decoder.close();
+          } catch {
+            // Декодер уже закрыт
+          }
+          resource.source?.close?.();
+          texture.destroy(true);
+        }
+      };
+    } catch (err) {
+      decoder.close();
+      throw err;
+    }
+  }
+
+  static async _videoFromBuffer(buffer, mime) {
+    const url = URL.createObjectURL(new Blob([buffer], { type: mime }));
+    try {
+      return await this._video(url, false, url);
+    } catch (err) {
+      URL.revokeObjectURL(url);
+      throw err;
+    }
+  }
+
+  static async _video(url, useCors, objectUrl = null) {
+    const video = document.createElement("video");
+    if (useCors) video.crossOrigin = "anonymous";
+    video.muted = true;
+    video.loop = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = url;
+    await waitForMedia(video, "loadeddata");
+
+    const texture = PIXI.Texture.from(video, {
+      resourceOptions: { autoPlay: true, updateFPS: 0 }
+    });
+    if (texture.baseTexture?.resource) {
+      texture.baseTexture.resource.autoUpdate = true;
+    }
+    return {
+      texture,
+      width: video.videoWidth || 300,
+      height: video.videoHeight || 300,
+      setActive(value) {
+        if (value && video.paused) {
+          // Отказ автозапуска не ошибка загрузки: первый кадр уже на холсте
+          video.play().catch(err => console.warn("Scene Shitposts | Браузер не дал запустить видео:", err));
+        } else if (!value && !video.paused) {
+          video.pause();
+        }
+      },
+      destroy() {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        texture.destroy(true);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }
+}
+
+/**
+ * Постоянный кеш файлов щитпостов в IndexedDB браузера. Файлы из worlds/<мир>/shitposts создаёт модуль
+ * под уникальными именами и не меняет, поэтому повторно их можно не скачивать даже после перезапуска игры.
+ * IndexedDB, в отличие от Cache Storage, работает и без HTTPS (игроки часто заходят по http://IP).
+ * Старые файлы вытесняются, когда кеш превышает лимит из настроек клиента.
+ */
+const PersistentCache = {
+  DB_NAME: `${MODULE_ID}-cache`,
+  _db: null,
+  _trimTimer: null,
+
+  limitBytes() {
+    try {
+      return Math.max(0, Number(game.settings.get(MODULE_ID, "localCacheMB")) || 0) * 1024 * 1024;
+    } catch {
+      return 0;
+    }
+  },
+
+  /**
+   * Ключ кеша для src или null, если файл не кешируется
+   */
+  keyFor(src) {
+    if (typeof indexedDB === "undefined" || !globalThis.game?.world || !this.limitBytes()) return null;
+    if (MediaUrlResolver.isRemote(src)) return null;
+    const path = MediaUrlResolver.normalize(src).split(/[?#]/)[0];
+    return path.startsWith(`worlds/${game.world.id}/shitposts/`) ? path : null;
+  },
+
+  _open() {
+    this._db ??= new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        db.createObjectStore("files");
+        // Размер и время последнего использования лежат отдельно, чтобы считать объём, не читая сами файлы
+        db.createObjectStore("meta").createIndex("lastUsed", "lastUsed");
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    }).catch(err => {
+      this._db = null;
+      throw err;
+    });
+    return this._db;
+  },
+
+  async get(key) {
+    try {
+      const db = await this._open();
+      const tx = db.transaction(["files", "meta"], "readwrite");
+      const file = await requestResult(tx.objectStore("files").get(key));
+      if (!file) return null;
+      tx.objectStore("meta").put({ size: file.buffer.byteLength, lastUsed: Date.now() }, key);
+      return { buffer: file.buffer, contentType: file.contentType };
+    } catch (err) {
+      console.warn("Scene Shitposts | Локальный кеш недоступен:", err);
+      return null;
+    }
+  },
+
+  async put(key, buffer, contentType) {
+    if (buffer.byteLength > this.limitBytes()) return;
+    try {
+      const db = await this._open();
+      const tx = db.transaction(["files", "meta"], "readwrite");
+      tx.objectStore("files").put({ buffer, contentType }, key);
+      tx.objectStore("meta").put({ size: buffer.byteLength, lastUsed: Date.now() }, key);
+      await transactionDone(tx);
+      // Вытеснение одно на пачку записей, а не на каждый файл
+      clearTimeout(this._trimTimer);
+      this._trimTimer = setTimeout(() => this.trim(), 2000);
+    } catch (err) {
+      console.warn("Scene Shitposts | Не удалось сохранить файл в локальный кеш:", err);
+    }
+  },
+
+  /**
+   * Удаляет давно не использованные файлы, пока кеш не уложится в лимит
+   */
+  async trim() {
+    try {
+      const limit = this.limitBytes();
+      const db = await this._open();
+      const tx = db.transaction(["files", "meta"], "readwrite");
+      const metaStore = tx.objectStore("meta");
+      const entries = [];
+      await new Promise((resolve, reject) => {
+        const request = metaStore.index("lastUsed").openCursor();
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return resolve();
+          entries.push({ key: cursor.primaryKey, size: cursor.value.size });
+          cursor.continue();
+        };
+        request.onerror = () => reject(request.error);
+      });
+      let total = entries.reduce((sum, entry) => sum + entry.size, 0);
+      for (const entry of entries) {
+        if (total <= limit) break;
+        tx.objectStore("files").delete(entry.key);
+        metaStore.delete(entry.key);
+        total -= entry.size;
+      }
+      await transactionDone(tx);
+    } catch (err) {
+      console.warn("Scene Shitposts | Не удалось очистить локальный кеш:", err);
+    }
+  },
+
+  async clear() {
+    try {
+      const db = await this._open();
+      const tx = db.transaction(["files", "meta"], "readwrite");
+      tx.objectStore("files").clear();
+      tx.objectStore("meta").clear();
+      await transactionDone(tx);
+    } catch (err) {
+      console.warn("Scene Shitposts | Не удалось очистить локальный кеш:", err);
+    }
+  }
+};
+
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function transactionDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+/**
+ * Очередь загрузки постов: одновременно грузится несколько файлов, и первыми — те, что видны на экране.
+ * Остальные подгружаются следом в фоне, поэтому тяжёлая сцена «оживает» с той части, куда смотрит игрок.
+ */
+const LoadQueue = {
+  MAX_ACTIVE: 4,
+  // Запас вокруг экрана в пикселях: посты чуть за краем грузятся вместе с видимыми
+  SCREEN_MARGIN: 300,
+  pending: new Set(),
+  active: 0,
+  _scheduled: false,
+
+  enqueue(node) {
+    this.pending.add(node);
+    this._schedulePump();
+  },
+
+  remove(node) {
+    this.pending.delete(node);
+  },
+
+  _schedulePump() {
+    if (this._scheduled) return;
+    this._scheduled = true;
+    // Ждём, пока syncPosts добавит все узлы на холст: до этого их положение на экране неизвестно
+    setTimeout(() => {
+      this._scheduled = false;
+      this._pump();
+    }, 0);
+  },
+
+  _pump() {
+    while (this.active < this.MAX_ACTIVE && this.pending.size) {
+      let next = null;
+      for (const node of this.pending) {
+        if (node.isOnScreen(this.SCREEN_MARGIN)) {
+          next = node;
+          break;
+        }
+      }
+      next ??= this.pending.values().next().value;
+      this.pending.delete(next);
+      if (next.destroyed) continue;
+      this.active++;
+      next._loadMedia().catch(err => console.error("Scene Shitposts | Ошибка загрузки поста:", err)).finally(() => {
+        this.active--;
+        this._pump();
+      });
+    }
+  }
+};
+
+function frameDelay(frame) {
+  // duration в микросекундах. Браузеры показывают кадры с задержкой <= 10 мс как 100 мс, повторяем это поведение
+  const ms = (frame.duration ?? 0) / 1000;
+  return ms <= 10 ? 100 : ms;
+}
+
+/**
+ * Ждёт, пока img/video загрузится (eventName) или упадёт с ошибкой
+ */
+function waitForMedia(element, eventName) {
+  return new Promise((resolve, reject) => {
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(element.error ?? new Error(`Файл не загрузился: ${element.src}`));
+    };
+    const cleanup = () => {
+      element.removeEventListener(eventName, onReady);
+      element.removeEventListener("error", onError);
+    };
+    element.addEventListener(eventName, onReady);
+    element.addEventListener("error", onError);
+    if (element instanceof HTMLVideoElement) element.load();
+  });
+}
+
+/**
+ * Общий кеш медиа: посты с одним и тем же файлом используют одну текстуру, один декодер анимации и один <video>.
+ * Анимации и видео ставятся на паузу, когда ни один их пост не виден на экране или окно свёрнуто.
+ */
+class MediaCache {
+  static entries = new Map();
+  static _watcher = null;
+
+  static acquire(src, type) {
+    let entry = this.entries.get(src);
+    if (!entry) {
+      entry = { src, refs: 0, nodes: new Set(), media: null, releaseTimer: null };
+      entry.promise = MediaLoader.load(src, type).then(media => (entry.media = media));
+      // После ошибки следующая попытка загрузит файл заново
+      entry.promise.catch(() => {
+        if (this.entries.get(src) === entry) this.entries.delete(src);
+      });
+      this.entries.set(src, entry);
+    }
+    clearTimeout(entry.releaseTimer);
+    entry.refs++;
+    this._startWatcher();
+    return entry;
+  }
+
+  static release(entry) {
+    entry.refs--;
+    if (entry.refs > 0) return;
+    entry.releaseTimer = setTimeout(() => {
+      if (entry.refs > 0) return;
+      if (this.entries.get(entry.src) === entry) this.entries.delete(entry.src);
+      entry.promise.then(media => media.destroy(), () => {});
+    }, MEDIA_RELEASE_DELAY);
+  }
+
+  static refresh(entry) {
+    if (!entry.media) return;
+    const watched = !document.hidden && [...entry.nodes].some(node => node.isOnScreen());
+    entry.media.setActive(watched);
+  }
+
+  static _startWatcher() {
+    if (this._watcher) return;
+    this._watcher = setInterval(() => {
+      for (const entry of this.entries.values()) this.refresh(entry);
+    }, MEDIA_WATCH_INTERVAL);
+  }
+}
+
+/**
+ * HTML-слой поверх холста для файлов, которые браузер не даёт загрузить в WebGL (хостинги без CORS).
+ * Слой повторяет сдвиг и масштаб холста, а перетаскивание и ресайз обрабатывает обычный узел PIXI под ним.
+ */
+const DomOverlay = {
+  root: null,
+  zCounter: 0,
+  _lastTransform: "",
+
+  ensure() {
+    if (this.root?.isConnected) return this.root;
+    const root = document.createElement("div");
+    root.id = "scene-shitposts-dom";
+    const board = document.getElementById("board");
+    if (board) board.after(root);
+    else document.body.append(root);
+    this.root = root;
+    this._lastTransform = "";
+    this.sync();
+    return root;
+  },
+
+  add(element) {
+    element.style.zIndex = String(++this.zCounter);
+    this.ensure().append(element);
+  },
+
+  bringToFront(element) {
+    element.style.zIndex = String(++this.zCounter);
+  },
+
+  sync() {
+    const layer = canvas?.shitpostLayer;
+    if (!this.root || !layer || layer.destroyed) return;
+    // Считаем матрицу по локальным трансформациям от слоя до корня сцены: worldTransform обновляется
+    // только при отрисовке и после сдвига холста может быть ещё старым
+    const m = new PIXI.Matrix();
+    for (let obj = layer; obj; obj = obj.parent) {
+      obj.transform.updateLocalTransform();
+      m.prepend(obj.transform.localTransform);
+    }
+    const transform = `matrix(${m.a}, ${m.b}, ${m.c}, ${m.d}, ${m.tx}, ${m.ty})`;
+    if (transform !== this._lastTransform) {
+      this.root.style.transform = transform;
+      this._lastTransform = transform;
+    }
+  }
+};
 
 /**
  * Интерактивный контейнер отдельного щитпоста с рамкой и 4 ручками трансформации
@@ -321,11 +969,10 @@ class ShitpostNode extends PIXI.Container {
     this.isDragging = false;
     this.isResizing = false;
     this.resizeHandle = null;
-    this.videoElement = null;
-    this.animation = null;
-    this.ownedTextures = [];
-    this.objectUrl = null;
+    this.mediaEntry = null;
+    this.domElement = null;
     this.loadToken = 0;
+    this.errorNotified = false;
 
     this.position.set(this.data.x, this.data.y);
     this.eventMode = "static";
@@ -345,7 +992,8 @@ class ShitpostNode extends PIXI.Container {
 
     this.handles = {};
     this._createHandles();
-    this._loadMedia();
+    this.refreshVisuals();
+    LoadQueue.enqueue(this);
     this._bindEvents();
   }
 
@@ -361,248 +1009,87 @@ class ShitpostNode extends PIXI.Container {
     return this.destroyed || token !== this.loadToken;
   }
 
+  isOnScreen(margin = 0) {
+    if (this.destroyed || !this.parent || !this.worldVisible) return false;
+    const bounds = this.getBounds();
+    const screen = canvas.app.screen;
+    return bounds.right > -margin && bounds.bottom > -margin
+      && bounds.left < screen.width + margin && bounds.top < screen.height + margin;
+  }
+
   async _loadMedia() {
     const token = ++this.loadToken;
     const { src, type } = await MediaUrlResolver.resolve(this.data.src);
     if (this._isStale(token)) return;
 
-    if (type === "video") {
-      await this._loadVideoMedia(src, token);
-    } else {
-      // Сюда же попадают старые посты с type "gif"
-      await this._loadImageMedia(src, token);
-    }
-  }
-
-  async _loadVideoMedia(src, token) {
+    // Старые посты с type "gif" загружаются как картинки
+    const entry = MediaCache.acquire(src, type === "video" ? "video" : "image");
+    this.mediaEntry = entry;
     try {
-      await this._playVideo(src, MediaUrlResolver.isRemote(src), token);
+      const media = await entry.promise;
+      if (this._isStale(token)) return;
+      entry.nodes.add(this);
+      this.mediaSprite.texture = media.texture;
+      this.mediaSprite.visible = true;
+      this.loadingSpinner.visible = false;
+      this._applyInitialDimensions(media.width, media.height);
+      MediaCache.refresh(entry);
     } catch (err) {
       if (this._isStale(token)) return;
-      // Хостинг без CORS: WebGL не может взять кадры такого видео, поэтому скачиваем его целиком и играем из Blob
-      try {
-        if (!MediaUrlResolver.isRemote(src)) throw err;
-        const { buffer, contentType } = await MediaUrlResolver.fetchMediaBuffer(src);
-        if (this._isStale(token)) return;
-        const mime = sniffMedia(buffer)?.mime || contentType.split(";")[0].trim() || "video/mp4";
-        await this._playVideo(this._createObjectUrl(buffer, mime), false, token);
-      } catch (fallbackErr) {
-        console.error("Scene Shitposts | Ошибка загрузки видео:", src, err, fallbackErr);
-        this._showErrorState(token);
+      if (err instanceof BlockedMediaError) {
+        this._showDomMedia(src, type, token);
+        return;
       }
-    }
-  }
-
-  async _playVideo(url, useCors, token) {
-    const video = document.createElement("video");
-    if (useCors) video.crossOrigin = "anonymous";
-    video.muted = true;
-    video.loop = true;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.preload = "auto";
-    video.src = url;
-
-    await new Promise((resolve, reject) => {
-      const onReady = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        reject(video.error ?? new Error(`Видео не загрузилось: ${url}`));
-      };
-      const cleanup = () => {
-        video.removeEventListener("loadeddata", onReady);
-        video.removeEventListener("error", onError);
-      };
-      video.addEventListener("loadeddata", onReady);
-      video.addEventListener("error", onError);
-      video.load();
-    });
-
-    if (this._isStale(token)) {
-      video.removeAttribute("src");
-      video.load();
-      return;
-    }
-
-    this.videoElement = video;
-    const tex = PIXI.Texture.from(video, {
-      resourceOptions: { autoPlay: true, updateFPS: 0 }
-    });
-    if (tex.baseTexture?.resource) {
-      tex.baseTexture.resource.autoUpdate = true;
-    }
-    this._showTexture(tex, true);
-    this._applyInitialDimensions(video.videoWidth || 300, video.videoHeight || 300);
-
-    // Отказ автозапуска не ошибка загрузки: первый кадр уже на холсте
-    video.play().catch(err => console.warn("Scene Shitposts | Браузер не дал запустить видео:", err));
-  }
-
-  async _loadImageMedia(src, token) {
-    let buffer;
-    let mime;
-    try {
-      const res = await MediaUrlResolver.fetchMediaBuffer(src);
-      buffer = res.buffer;
-      mime = sniffMedia(buffer)?.mime || res.contentType.split(";")[0].trim() || "image/png";
-    } catch {
-      // Если совсем не вышло через fetch, пробуем нативный загрузчик Foundry
-      await this._loadViaFoundry(src, token);
-      return;
-    }
-    if (this._isStale(token)) return;
-
-    // Ссылка с расширением .gif, внутри которой на самом деле MP4/WebM
-    if (mime.startsWith("video/")) {
-      try {
-        await this._playVideo(this._createObjectUrl(buffer, mime), false, token);
-      } catch (err) {
-        console.error("Scene Shitposts | Ошибка загрузки видео:", src, err);
-        this._showErrorState(token);
-      }
-      return;
-    }
-
-    try {
-      if (await this._playAnimated(buffer, mime, token)) return;
-    } catch (err) {
-      console.warn("Scene Shitposts | ImageDecoder не смог декодировать анимацию, открываем как статику:", src, err);
-    }
-    if (this._isStale(token)) return;
-
-    try {
-      await this._loadFromBuffer(buffer, mime, token);
-    } catch {
-      await this._loadViaFoundry(src, token);
-    }
-  }
-
-  /**
-   * Проигрывает анимированный GIF / WebP / APNG / AVIF. Кадры декодируются по одному
-   * в один и тот же canvas, поэтому длинные гифки не забивают память видеокарты.
-   * Возвращает false, если файл не анимирован или браузер не умеет его декодировать.
-   */
-  async _playAnimated(buffer, mime, token) {
-    if (!ANIMATABLE_MIMES.has(mime) || typeof ImageDecoder === "undefined") return false;
-    if (!(await ImageDecoder.isTypeSupported(mime))) return false;
-
-    const decoder = new ImageDecoder({ data: buffer, type: mime });
-    try {
-      await decoder.tracks.ready;
-      // Количество кадров окончательное только после разбора всего файла
-      await decoder.completed;
-      const frameCount = decoder.tracks.selectedTrack?.frameCount ?? 0;
-      if (frameCount < 2 || this._isStale(token)) {
-        decoder.close();
-        return false;
-      }
-
-      const first = (await decoder.decode({ frameIndex: 0 })).image;
-      const frameCanvas = document.createElement("canvas");
-      frameCanvas.width = first.displayWidth;
-      frameCanvas.height = first.displayHeight;
-      const ctx = frameCanvas.getContext("2d");
-      ctx.drawImage(first, 0, 0);
-      const firstDelay = this._frameDelay(first);
-      first.close();
-
-      if (this._isStale(token)) {
-        decoder.close();
-        return true;
-      }
-
-      const tex = PIXI.Texture.from(frameCanvas);
-      this.animation = { decoder, timer: null, closed: false };
-      this._showTexture(tex, true);
-      this._applyInitialDimensions(frameCanvas.width, frameCanvas.height);
-
-      const animation = this.animation;
-      let frameIndex = 0;
-      const playNextFrame = async () => {
-        if (animation.closed) return;
-        const started = performance.now();
-        frameIndex = (frameIndex + 1) % frameCount;
-        let delay = 100;
-        try {
-          const frame = (await decoder.decode({ frameIndex })).image;
-          if (animation.closed) {
-            frame.close();
-            return;
-          }
-          // ImageDecoder отдаёт уже собранные полные кадры, поэтому старый кадр просто затираем
-          ctx.clearRect(0, 0, frameCanvas.width, frameCanvas.height);
-          ctx.drawImage(frame, 0, 0);
-          delay = this._frameDelay(frame);
-          frame.close();
-          tex.baseTexture.update();
-        } catch (err) {
-          if (animation.closed) return;
-          console.warn("Scene Shitposts | Ошибка декодирования кадра:", err);
-        }
-        animation.timer = setTimeout(playNextFrame, Math.max(0, delay - (performance.now() - started)));
-      };
-      animation.timer = setTimeout(playNextFrame, firstDelay);
-      return true;
-    } catch (err) {
-      decoder.close();
-      throw err;
-    }
-  }
-
-  _frameDelay(frame) {
-    // duration в микросекундах. Браузеры показывают кадры с задержкой <= 10 мс как 100 мс, повторяем это поведение
-    const ms = (frame.duration ?? 0) / 1000;
-    return ms <= 10 ? 100 : ms;
-  }
-
-  _createObjectUrl(buffer, mime) {
-    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
-    this.objectUrl = URL.createObjectURL(new Blob([buffer], { type: mime }));
-    return this.objectUrl;
-  }
-
-  async _loadFromBuffer(buffer, mime, token) {
-    const objectUrl = URL.createObjectURL(new Blob([buffer], { type: mime }));
-    try {
-      const img = await new Promise((resolve, reject) => {
-        const image = new Image();
-        image.onload = () => resolve(image);
-        image.onerror = reject;
-        image.src = objectUrl;
-      });
-      await img.decode?.().catch(() => {});
-      if (this._isStale(token)) return;
-      this._showTexture(PIXI.Texture.from(img), true);
-      this._applyInitialDimensions(img.naturalWidth || 300, img.naturalHeight || 300);
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
-  }
-
-  async _loadViaFoundry(src, token) {
-    try {
-      const tex = await Compat.loadTexture(src);
-      if (this._isStale(token) || !tex) return;
-      // Текстуры из кеша Foundry общие, их не уничтожаем
-      this._showTexture(tex, false);
-      this._applyInitialDimensions(tex.width || 300, tex.height || 300);
-    } catch (err) {
-      console.error("Scene Shitposts | Не удалось загрузить изображение:", src, err);
+      console.error("Scene Shitposts | Не удалось загрузить файл:", src, err);
       this._showErrorState(token);
     }
   }
 
-  _showTexture(tex, owned) {
-    if (owned) this.ownedTextures.push(tex);
-    this.mediaSprite.texture = tex;
-    this.mediaSprite.visible = true;
-    this.loadingSpinner.visible = false;
+  /**
+   * Показывает файл обычным <img>/<video> поверх холста: так браузер покажет картинку с любого сайта
+   */
+  _showDomMedia(src, type, token) {
+    const isVideo = type === "video";
+    const element = document.createElement(isVideo ? "video" : "img");
+    element.className = "shitpost-dom-media";
+    element.draggable = false;
+    if (isVideo) {
+      element.muted = true;
+      element.loop = true;
+      element.autoplay = true;
+      element.playsInline = true;
+    }
+    element.src = src;
+    this.domElement = element;
+    DomOverlay.add(element);
+    this.refreshVisuals();
+
+    waitForMedia(element, isVideo ? "loadeddata" : "load").then(
+      () => {
+        if (this._isStale(token)) return;
+        this.loadingSpinner.visible = false;
+        const width = isVideo ? element.videoWidth : element.naturalWidth;
+        const height = isVideo ? element.videoHeight : element.naturalHeight;
+        this._applyInitialDimensions(width || 300, height || 300);
+      },
+      (err) => {
+        if (this._isStale(token)) return;
+        console.error("Scene Shitposts | Не удалось загрузить файл:", src, err);
+        this._removeDomMedia();
+        this._showErrorState(token, true);
+      }
+    );
   }
 
-  _showErrorState(token) {
+  _removeDomMedia() {
+    if (!this.domElement) return;
+    this.domElement.pause?.();
+    this.domElement.removeAttribute("src");
+    this.domElement.remove();
+    this.domElement = null;
+  }
+
+  _showErrorState(token, blocked = false) {
     if (this._isStale(token)) return;
     this.loadingSpinner.clear();
     this.loadingSpinner.beginFill(0x550000, 0.7);
@@ -610,6 +1097,15 @@ class ShitpostNode extends PIXI.Container {
     this.loadingSpinner.drawRoundedRect(-60, -60, 120, 120, 12);
     this.loadingSpinner.endFill();
     this.loadingSpinner.visible = true;
+
+    // Автору свежего поста объясняем, что пошло не так
+    const isFresh = Date.now() - (this.data.createdAt ?? 0) < FRESH_POST_MS;
+    if (this.data.authorId === game.user.id && isFresh && !this.errorNotified) {
+      this.errorNotified = true;
+      ui.notifications.warn(blocked
+        ? "Scene Shitposts: сайт не отдаёт этот файл. Скопируйте прямую ссылку на картинку (ПКМ → «Копировать адрес изображения») или попросите ГМа настроить CORS-прокси в настройках модуля."
+        : "Scene Shitposts: не удалось загрузить картинку по этой ссылке.");
+    }
   }
 
   _applyInitialDimensions(natWidth, natHeight) {
@@ -691,6 +1187,18 @@ class ShitpostNode extends PIXI.Container {
     this.mediaSprite.width = w;
     this.mediaSprite.height = h;
     this.position.set(this.data.x, this.data.y);
+    // Область клика: вся картинка (и прозрачные места, и HTML-пост) плюс выступающие ручки
+    this.hitArea = new PIXI.Rectangle(-w / 2 - 8, -h / 2 - 8, w + 16, h + 16);
+
+    if (this.domElement) {
+      const style = this.domElement.style;
+      style.left = `${this.data.x - w / 2}px`;
+      style.top = `${this.data.y - h / 2}px`;
+      style.width = `${w}px`;
+      style.height = `${h}px`;
+      style.opacity = String(this.alpha);
+      this.domElement.classList.toggle("selected", this.isSelected);
+    }
 
     this.border.clear();
     if (this.isSelected) {
@@ -710,6 +1218,7 @@ class ShitpostNode extends PIXI.Container {
 
   setSelected(selected) {
     this.isSelected = selected;
+    if (selected && this.domElement) DomOverlay.bringToFront(this.domElement);
     this.refreshVisuals();
   }
 
@@ -722,6 +1231,7 @@ class ShitpostNode extends PIXI.Container {
       if (!this.isResizing) {
         this.isDragging = true;
         this.alpha = 0.85;
+        this.refreshVisuals();
         const localPos = this.layer.toLocal(e.global);
         this.dragOffset = {
           x: this.x - localPos.x,
@@ -738,42 +1248,38 @@ class ShitpostNode extends PIXI.Container {
     if (this.isDragging) {
       this.data.x = Math.round(pos.x + this.dragOffset.x);
       this.data.y = Math.round(pos.y + this.dragOffset.y);
-      this.position.set(this.data.x, this.data.y);
+      this.refreshVisuals();
     } else if (this.isResizing) {
-      const dx = pos.x - this.resizeStart.mouse.x;
-      const dy = pos.y - this.resizeStart.mouse.y;
-      let newW = this.resizeStart.w;
-      let newH = this.resizeStart.h;
-      let newX = this.resizeStart.x;
-      let newY = this.resizeStart.y;
-
+      const start = this.resizeStart;
+      const dx = pos.x - start.mouse.x;
+      const dy = pos.y - start.mouse.y;
+      // Ручки только угловые: тянем вправо/влево и вниз/вверх, противоположный угол остаётся на месте
+      const signX = this.resizeHandle.includes("r") ? 1 : -1;
+      const signY = this.resizeHandle.includes("b") ? 1 : -1;
       const minSize = 30;
 
-      if (this.resizeHandle.includes("r")) {
-        newW = Math.max(minSize, this.resizeStart.w + dx);
-        newX = this.resizeStart.x + (newW - this.resizeStart.w) / 2;
-      } else if (this.resizeHandle.includes("l")) {
-        newW = Math.max(minSize, this.resizeStart.w - dx);
-        newX = this.resizeStart.x - (newW - this.resizeStart.w) / 2;
-      }
-
-      if (this.resizeHandle.includes("b")) {
-        newH = Math.max(minSize, this.resizeStart.h + dy);
-        newY = this.resizeStart.y + (newH - this.resizeStart.h) / 2;
-      } else if (this.resizeHandle.includes("t")) {
-        newH = Math.max(minSize, this.resizeStart.h - dy);
-        newY = this.resizeStart.y - (newH - this.resizeStart.h) / 2;
-      }
+      let newW = Math.max(minSize, start.w + signX * dx);
+      let newH = Math.max(minSize, start.h + signY * dy);
 
       if (e.shiftKey) {
-        const ratio = this.resizeStart.w / this.resizeStart.h;
-        newH = newW / ratio;
+        // Сохраняем пропорции по той стороне, которую потянули сильнее
+        const ratio = start.w / start.h;
+        if (Math.abs(newW - start.w) / start.w >= Math.abs(newH - start.h) / start.h) {
+          newH = newW / ratio;
+        } else {
+          newW = newH * ratio;
+        }
+        if (newW < minSize || newH < minSize) {
+          const fix = Math.max(minSize / newW, minSize / newH);
+          newW *= fix;
+          newH *= fix;
+        }
       }
 
       this.data.width = Math.round(newW);
       this.data.height = Math.round(newH);
-      this.data.x = Math.round(newX);
-      this.data.y = Math.round(newY);
+      this.data.x = Math.round(start.x + (signX * (newW - start.w)) / 2);
+      this.data.y = Math.round(start.y + (signY * (newH - start.h)) / 2);
       this.refreshVisuals();
     }
   }
@@ -785,6 +1291,7 @@ class ShitpostNode extends PIXI.Container {
     this.isResizing = false;
     this.resizeHandle = null;
     this.alpha = 1.0;
+    this.refreshVisuals();
 
     ShitpostManager.updatePost({
       id: this.data.id,
@@ -803,44 +1310,30 @@ class ShitpostNode extends PIXI.Container {
       this._drawLoadingPlaceholder();
       this.loadingSpinner.visible = true;
       this.refreshVisuals();
-      this._loadMedia();
+      LoadQueue.enqueue(this);
     } else if (!this.isDragging && !this.isResizing) {
       this.refreshVisuals();
     }
   }
 
   _cleanupMedia() {
-    // Отменяет загрузки, которые ещё не завершились
+    // Отменяет загрузки, которые ещё не завершились или ждут своей очереди
     this.loadToken++;
+    LoadQueue.remove(this);
 
-    if (this.animation) {
-      this.animation.closed = true;
-      clearTimeout(this.animation.timer);
-      try {
-        this.animation.decoder.close();
-      } catch {
-        // Декодер уже закрыт
-      }
-      this.animation = null;
-    }
-    if (this.videoElement) {
-      this.videoElement.pause();
-      this.videoElement.removeAttribute("src");
-      this.videoElement.load();
-      this.videoElement = null;
-    }
+    // Текстура общая для всех постов с этим файлом: отпускаем её, а уничтожит кеш, когда она никому не нужна
     if (this.mediaSprite && !this.mediaSprite.destroyed) {
       this.mediaSprite.texture = PIXI.Texture.EMPTY;
       this.mediaSprite.visible = false;
     }
-    for (const tex of this.ownedTextures) {
-      tex.destroy(true);
+    if (this.mediaEntry) {
+      this.mediaEntry.nodes.delete(this);
+      // Если пост был последним видимым, анимация встаёт на паузу сразу, а не на следующей проверке
+      MediaCache.refresh(this.mediaEntry);
+      MediaCache.release(this.mediaEntry);
+      this.mediaEntry = null;
     }
-    this.ownedTextures = [];
-    if (this.objectUrl) {
-      URL.revokeObjectURL(this.objectUrl);
-      this.objectUrl = null;
-    }
+    this._removeDomMedia();
   }
 
   destroy(options) {
@@ -860,6 +1353,10 @@ class ShitpostLayer extends PIXI.Container {
     this.sortableChildren = true;
     this.zIndex = 9999;
     this._bindStageEvents();
+
+    // HTML-слой подстраивается под сдвиг и масштаб холста после каждой отрисовки
+    this._onTick = () => DomOverlay.sync();
+    canvas.app?.ticker.add(this._onTick, null, PIXI.UPDATE_PRIORITY.UTILITY);
   }
 
   _bindStageEvents() {
@@ -921,7 +1418,7 @@ class ShitpostLayer extends PIXI.Container {
 
   syncPosts() {
     if (!canvas.scene) return;
-    const posts = canvas.scene.getFlag(MODULE_ID, "posts") || [];
+    const posts = PostStore.list(canvas.scene);
     const incomingIds = new Set(posts.map(p => p.id));
 
     for (const [id, node] of this.nodes.entries()) {
@@ -962,10 +1459,51 @@ class ShitpostLayer extends PIXI.Container {
     if (this._onWindowBlur) {
       window.removeEventListener("blur", this._onWindowBlur);
     }
+    canvas?.app?.ticker.remove(this._onTick);
     this.clearAllNodes();
     super.destroy(options);
   }
 }
+
+/**
+ * Хранение постов в флагах сцены. Каждый пост лежит под своим ключом flags.<модуль>.items.<id>,
+ * поэтому одновременные изменения разных постов не затирают друг друга.
+ * Старый формат (весь список массивом во flags.<модуль>.posts) переносится при первой записи.
+ */
+const PostStore = {
+  list(scene) {
+    const flags = scene?.flags?.[MODULE_ID] ?? {};
+    const byId = new Map();
+    if (Array.isArray(flags.posts)) {
+      flags.posts.forEach((post, index) => {
+        if (post?.id) byId.set(post.id, { createdAt: index, ...post });
+      });
+    }
+    for (const [id, post] of Object.entries(flags.items ?? {})) {
+      // Обновление, пришедшее после удаления поста, оставляет обрывок без src — его не показываем
+      if (post?.src) byId.set(id, { ...post, id });
+    }
+    return [...byId.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+  },
+
+  has(scene, id) {
+    return Boolean(scene?.flags?.[MODULE_ID]?.items?.[id]?.src);
+  },
+
+  itemPath(id) {
+    return `flags.${MODULE_ID}.items.${id}`;
+  },
+
+  async migrate(scene) {
+    const legacy = scene?.flags?.[MODULE_ID]?.posts;
+    if (!Array.isArray(legacy)) return;
+    const update = Compat.deletion(`flags.${MODULE_ID}.posts`);
+    legacy.forEach((post, index) => {
+      if (post?.id) update[this.itemPath(post.id)] = { createdAt: index, ...post };
+    });
+    await scene.update(update);
+  }
+};
 
 /**
  * Менеджер синхронизации, буфера обмена и сокетов
@@ -1002,12 +1540,12 @@ class ShitpostManager {
   }
 
   static async addPost(postData) {
-    if (!canvas.scene) return;
+    if (!canvas.scene || !this.canReachGM()) return;
 
     const isFreshLink = !postData.type;
     const resolved = isFreshLink
       ? await MediaUrlResolver.resolve(postData.src)
-      : { src: postData.src, type: postData.type };
+      : { src: MediaUrlResolver.normalize(postData.src), type: postData.type };
 
     const newPost = {
       id: foundry.utils.randomID(),
@@ -1017,17 +1555,18 @@ class ShitpostManager {
       y: postData.y,
       width: postData.width || null,
       height: postData.height || null,
-      authorId: game.user.id
+      authorId: game.user.id,
+      createdAt: Date.now()
     };
 
     // Новую внешнюю ссылку сохраняем в папку мира: все клиенты грузят её с сервера Foundry,
-    // без CORS-прокси, а протухшие ссылки Discord продолжают работать
+    // а протухшие ссылки Discord продолжают работать
     if (isFreshLink && this.shouldCacheRemote(newPost.src)) {
       if (this.canUpload()) {
         const cached = await this.cacheRemoteMedia(newPost.src);
         if (cached) Object.assign(newPost, cached);
       } else {
-        game.socket.emit(SOCKET_NAME, { action: "CACHE_AND_ADD", sceneId: canvas.scene.id, post: newPost });
+        this.sendToGM({ action: "CACHE_AND_ADD", sceneId: canvas.scene.id, post: newPost });
         return;
       }
     }
@@ -1035,7 +1574,33 @@ class ShitpostManager {
     if (game.user.isGM) {
       await this._gmAddPost(canvas.scene.id, newPost);
     } else {
-      game.socket.emit(SOCKET_NAME, { action: "ADD_POST", sceneId: canvas.scene.id, post: newPost });
+      this.sendToGM({ action: "ADD_POST", sceneId: canvas.scene.id, post: newPost });
+    }
+  }
+
+  /**
+   * Игроки не могут менять сцену сами, все их изменения записывает активный ГМ.
+   * Без ГМа в игре предупреждаем, а не теряем действие молча
+   */
+  static canReachGM() {
+    if (game.user.isGM || game.users.activeGM) return true;
+    ui.notifications.warn("Scene Shitposts: в игре нет ГМа. Щитпосты игроков сохраняются через ГМа, попробуйте, когда он зайдёт.");
+    return false;
+  }
+
+  static sendToGM(payload) {
+    if (!this.canReachGM()) return;
+    game.socket.emit(SOCKET_NAME, { ...payload, userId: game.user.id });
+  }
+
+  /**
+   * Показывает уведомление пользователю userId: себе — сразу, другому — через сокет
+   */
+  static notifyUser(userId, level, message) {
+    if (!userId || userId === game.user.id) {
+      ui.notifications[level](message);
+    } else {
+      game.socket.emit(SOCKET_NAME, { action: "NOTIFY", userId, level, message });
     }
   }
 
@@ -1082,7 +1647,7 @@ class ShitpostManager {
     if (game.user.isGM) {
       await this._gmUpdatePost(canvas.scene.id, partialData);
     } else {
-      game.socket.emit(SOCKET_NAME, { action: "UPDATE_POST", sceneId: canvas.scene.id, update: partialData });
+      this.sendToGM({ action: "UPDATE_POST", sceneId: canvas.scene.id, update: partialData });
     }
   }
 
@@ -1091,35 +1656,33 @@ class ShitpostManager {
     if (game.user.isGM) {
       await this._gmDeletePost(canvas.scene.id, postId);
     } else {
-      game.socket.emit(SOCKET_NAME, { action: "DELETE_POST", sceneId: canvas.scene.id, postId });
+      this.sendToGM({ action: "DELETE_POST", sceneId: canvas.scene.id, postId });
     }
   }
 
   static async _gmAddPost(sceneId, post) {
     const scene = game.scenes.get(sceneId);
-    if (!scene) return;
-    const posts = foundry.utils.deepClone(scene.getFlag(MODULE_ID, "posts") || []);
-    posts.push(post);
-    await scene.setFlag(MODULE_ID, "posts", posts);
+    if (!scene || !post?.id || !post.src) return;
+    await PostStore.migrate(scene);
+    await scene.update({ [PostStore.itemPath(post.id)]: post });
   }
 
   static async _gmUpdatePost(sceneId, update) {
     const scene = game.scenes.get(sceneId);
-    if (!scene) return;
-    const posts = foundry.utils.deepClone(scene.getFlag(MODULE_ID, "posts") || []);
-    const idx = posts.findIndex(p => p.id === update.id);
-    if (idx !== -1) {
-      posts[idx] = foundry.utils.mergeObject(posts[idx], update);
-      await scene.setFlag(MODULE_ID, "posts", posts);
-    }
+    if (!scene || !update?.id) return;
+    await PostStore.migrate(scene);
+    // Пост могли удалить, пока его двигали: не воскрешаем его обрывком
+    if (!PostStore.has(scene, update.id)) return;
+    const { id, ...fields } = update;
+    await scene.update({ [PostStore.itemPath(id)]: fields });
   }
 
   static async _gmDeletePost(sceneId, postId) {
     const scene = game.scenes.get(sceneId);
-    if (!scene) return;
-    let posts = foundry.utils.deepClone(scene.getFlag(MODULE_ID, "posts") || []);
-    posts = posts.filter(p => p.id !== postId);
-    await scene.setFlag(MODULE_ID, "posts", posts);
+    if (!scene || !postId) return;
+    await PostStore.migrate(scene);
+    if (!scene.flags?.[MODULE_ID]?.items?.[postId]) return;
+    await scene.update(Compat.deletion(PostStore.itemPath(postId)));
   }
 
   static async handleRawImageBlob(blob, spawnPos) {
@@ -1134,10 +1697,13 @@ class ShitpostManager {
         const path = await this.uploadToWorld(file);
         if (path) {
           await this.addPost({ src: path, type: "image", x: spawnPos.x, y: spawnPos.y });
+        } else {
+          ui.notifications.error("Scene Shitposts: сервер Foundry не принял файл. Проверьте права на загрузку файлов.");
         }
       } else {
+        if (!this.canReachGM()) return;
         const base64 = await this._blobToBase64(finalBlob);
-        game.socket.emit(SOCKET_NAME, {
+        this.sendToGM({
           action: "UPLOAD_AND_SPAWN",
           sceneId: canvas.scene.id,
           base64,
@@ -1228,10 +1794,37 @@ Hooks.once("init", () => {
     type: Boolean,
     default: true
   });
+
+  game.settings.register(MODULE_ID, "corsProxy", {
+    name: "CORS-прокси для внешних ссылок (необязательно)",
+    hint: "Адрес прокси, через который модуль скачивает файлы с сайтов, запрещающих прямую загрузку (страницы Tenor, Klipy и др.). {url} в адресе заменяется ссылкой, иначе она добавляется как ?url=. Без прокси такие картинки всё равно показываются, но поверх холста и без сохранения на сервер. Как бесплатно сделать свой прокси — в README модуля.",
+    scope: "world",
+    config: true,
+    type: String,
+    default: ""
+  });
+
+  game.settings.register(MODULE_ID, "localCacheMB", {
+    name: "Локальный кеш щитпостов, МБ",
+    hint: "Картинки и гифки сцен хранятся в браузере этого игрока, чтобы при возврате на сцену и после перезапуска игры не скачивать их с сервера заново. Самые старые файлы удаляются, когда кеш превышает лимит. 0 — не кешировать и очистить кеш.",
+    scope: "client",
+    config: true,
+    type: Number,
+    range: { min: 0, max: 4000, step: 100 },
+    default: 500,
+    onChange: (value) => {
+      if (!Number(value)) PersistentCache.clear();
+      else PersistentCache.trim();
+    }
+  });
 });
 
 Hooks.once("ready", () => {
   game.socket.on(SOCKET_NAME, async (payload) => {
+    if (payload.action === "NOTIFY") {
+      if (payload.userId === game.user.id) ui.notifications[payload.level ?? "info"](payload.message);
+      return;
+    }
     if (!game.user.isGM) return;
     if (game.users.activeGM?.id !== game.user.id) return;
 
@@ -1243,7 +1836,8 @@ Hooks.once("ready", () => {
       } else if (payload.action === "DELETE_POST") {
         await ShitpostManager._gmDeletePost(payload.sceneId, payload.postId);
       } else if (payload.action === "CACHE_AND_ADD") {
-        // У игрока нет права загружать файлы: ГМ сам скачивает ссылку и сохраняет её в мир
+        // У игрока нет права загружать файлы: ГМ сам скачивает ссылку и сохраняет её в мир.
+        // Если не вышло, пост остаётся внешней ссылкой
         const post = payload.post;
         const cached = await ShitpostManager.cacheRemoteMedia(post.src);
         if (cached) Object.assign(post, cached);
@@ -1253,23 +1847,31 @@ Hooks.once("ready", () => {
         const blob = await res.blob();
         const file = new File([blob], payload.fileName, { type: payload.mimeType || "image/webp" });
         const path = await ShitpostManager.uploadToWorld(file);
-        if (path) {
-          await ShitpostManager._gmAddPost(payload.sceneId, {
-            id: foundry.utils.randomID(),
-            src: path,
-            type: "image",
-            x: payload.x,
-            y: payload.y,
-            width: null,
-            height: null,
-            authorId: payload.authorId
-          });
-        }
+        if (!path) throw new Error("Сервер Foundry не принял файл");
+        await ShitpostManager._gmAddPost(payload.sceneId, {
+          id: foundry.utils.randomID(),
+          src: path,
+          type: "image",
+          x: payload.x,
+          y: payload.y,
+          width: null,
+          height: null,
+          authorId: payload.authorId,
+          createdAt: Date.now()
+        });
       }
     } catch (err) {
       console.error(`Scene Shitposts | Ошибка обработки запроса ${payload.action}:`, err);
+      ShitpostManager.notifyUser(payload.userId, "error", "Scene Shitposts: ГМ не смог сохранить ваш щитпост, попробуйте ещё раз.");
     }
   });
+
+  // Активный ГМ переводит сцены со старым форматом хранения на новый
+  if (game.user.isGM && game.users.activeGM?.isSelf) {
+    for (const scene of game.scenes) {
+      PostStore.migrate(scene).catch(err => console.warn("Scene Shitposts | Не удалось перенести посты сцены:", scene.name, err));
+    }
+  }
 
   window.addEventListener("keydown", async (e) => {
     if (isTypingInInput() || !canvas?.ready) return;
@@ -1410,6 +2012,9 @@ Hooks.on("canvasReady", () => {
 
   layer.syncPosts();
 });
+
+// Сдвиг и зум холста: HTML-слой обновляется сразу, не дожидаясь следующего кадра
+Hooks.on("canvasPan", () => DomOverlay.sync());
 
 Hooks.on("canvasTearDown", () => {
   if (canvas.shitpostLayer) {
