@@ -2,90 +2,262 @@ const MODULE_ID = "scene-shitposts";
 const SOCKET_NAME = `module.${MODULE_ID}`;
 const CLONE_PREFIX = "SHITPOST_CLONE::";
 
+const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "m4v", "mov", "ogv"]);
+const IMAGE_EXTENSIONS = new Set(["gif", "png", "apng", "jpg", "jpeg", "jfif", "webp", "avif", "bmp", "svg"]);
+// Расширения, которые точно не бывают анимированными: для них при вставке достаточно битмапа из буфера
+const STATIC_EXTENSIONS = new Set(["jpg", "jpeg", "jfif", "bmp", "svg"]);
+const ANIMATABLE_MIMES = new Set(["image/gif", "image/webp", "image/png", "image/avif"]);
+const MIME_EXTENSIONS = {
+  "image/gif": "gif",
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/avif": "avif",
+  "image/bmp": "bmp",
+  "image/svg+xml": "svg",
+  "video/mp4": "mp4",
+  "video/webm": "webm"
+};
+// Не сохраняем на сервер файлы крупнее этого размера, оставляем внешнюю ссылку
+const MAX_CACHE_BYTES = 30 * 1024 * 1024;
+// Публичные CORS-прокси, используются по очереди, если хостинг не отдаёт CORS-заголовки
+const CORS_PROXIES = [
+  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+];
+
 /**
- * Утилита для превращения любых ссылок (Discord Attachments, Discord Proxy, Klipy, Tenor) в прямые рабочие медиа-файлы
+ * Обёртки над API, которые переехали между версиями Foundry (v12 — глобалы, v13+ — неймспейс foundry.*)
+ */
+const Compat = {
+  get FilePicker() {
+    return foundry.applications?.apps?.FilePicker?.implementation ?? globalThis.FilePicker;
+  },
+  loadTexture(src) {
+    const loader = foundry.canvas?.loadTexture ?? globalThis.loadTexture;
+    return loader(src);
+  }
+};
+
+/**
+ * Определяет реальный формат файла по первым байтам, не доверяя расширению и Content-Type
+ */
+function sniffMedia(buffer) {
+  const arr = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 64));
+  if (arr.length < 12) return null;
+  const ascii = (from, to) => String.fromCharCode(...arr.subarray(from, to));
+
+  // GIF87a / GIF89a
+  if (ascii(0, 4) === "GIF8") return { mime: "image/gif", type: "image" };
+  // PNG (в том числе APNG)
+  if (arr[0] === 0x89 && ascii(1, 4) === "PNG") return { mime: "image/png", type: "image" };
+  // JPEG
+  if (arr[0] === 0xff && arr[1] === 0xd8 && arr[2] === 0xff) return { mime: "image/jpeg", type: "image" };
+  // WEBP: RIFF....WEBP
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return { mime: "image/webp", type: "image" };
+  // BMP
+  if (ascii(0, 2) === "BM") return { mime: "image/bmp", type: "image" };
+  // ISO BMFF: ....ftyp<brand> — AVIF или MP4/MOV
+  if (ascii(4, 8) === "ftyp") {
+    const brand = ascii(8, 12);
+    if (brand === "avif" || brand === "avis") return { mime: "image/avif", type: "image" };
+    return { mime: "video/mp4", type: "video" };
+  }
+  // WebM / Matroska
+  if (arr[0] === 0x1a && arr[1] === 0x45 && arr[2] === 0xdf && arr[3] === 0xa3) {
+    return { mime: "video/webm", type: "video" };
+  }
+
+  const head = new TextDecoder().decode(arr).trimStart().toLowerCase();
+  if (head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"))) {
+    return { mime: "image/svg+xml", type: "image" };
+  }
+  if (head.startsWith("<!doctype html") || head.startsWith("<html") || head.startsWith("<head") || head.startsWith("<!--")) {
+    return { mime: "text/html", html: new TextDecoder().decode(buffer) };
+  }
+  return null;
+}
+
+/**
+ * Короткий стабильный хеш строки (FNV-1a), чтобы одна и та же ссылка сохранялась в один и тот же файл
+ */
+function hashString(str) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Утилита для превращения любых ссылок (Discord Attachments, Discord Proxy, Giphy, Tenor, Klipy, Imgur) в прямые рабочие медиа-файлы
  */
 class MediaUrlResolver {
+  // Недавно скачанные файлы: resolve() и загрузка на холст не качают один и тот же файл дважды
+  static _bufferCache = new Map();
+
   static async resolve(rawUrl) {
-    let url = rawUrl.trim();
+    const url = this.normalize(rawUrl);
 
-    // 1. Обработка вложений Discord (media.discordapp.net/attachments/... -> cdn.discordapp.com/attachments/...)
-    // На cdn.discordapp.com открыт CORS (Access-Control-Allow-Origin: *) и отдаётся оригинал без сжатия
-    if (/^https?:\/\/media\.discordapp\.net\/attachments\//i.test(url)) {
-      try {
-        const parsed = new URL(url);
-        parsed.hostname = "cdn.discordapp.com";
-        // Удаляем параметры ресайза прокси Дискорда, которые ломают анимацию и подпись
-        parsed.searchParams.delete("width");
-        parsed.searchParams.delete("height");
-        parsed.searchParams.delete("format");
-        parsed.searchParams.delete("quality");
-        parsed.searchParams.delete(""); // убирает висящий "&=" в конце ссылок Дискорда
-        url = parsed.toString();
-      } catch (e) {
-        url = url.replace(/^https?:\/\/media\.discordapp\.net/i, "https://cdn.discordapp.com");
-      }
-    }
+    const byExtension = this.typeFromExtension(url);
+    if (byExtension) return { src: url, type: byExtension };
+    if (!this.isRemote(url)) return { src: url, type: "image" };
 
-    // 2. Вытаскиваем прямую ссылку из внешнего прокси Дискорда (images-ext-1.discordapp.net/external/.../https/...)
-    const discordProxyMatch = url.match(/discordapp\.net\/external\/[^/]+\/(https?)\/(.+)$/i);
-    if (discordProxyMatch) {
-      const protocol = discordProxyMatch[1].toLowerCase();
-      let cleanPath = discordProxyMatch[2];
-      url = `${protocol}://${cleanPath}`;
-    }
-
-    // 3. Определяем тип по расширению файла в пути URL
-    if (/\.(mp4|webm|mov)(\?.*)?$/i.test(url)) {
-      return { src: url, type: "video" };
-    }
-    if (/\.gif(\?.*)?$/i.test(url)) {
-      return { src: url, type: "gif" };
-    }
-    if (/\.(png|jpg|jpeg|webp|avif|svg)(\?.*)?$/i.test(url)) {
-      return { src: url, type: "image" };
-    }
-
-    // 4. Если это ссылка на веб-страницу (например, klipy.com/gifs/..., tenor.com/view/..., giphy.com/...)
+    // Расширения нет (или оно незнакомое): скачиваем и смотрим, что внутри.
+    // Если это HTML-страница (tenor.com/view/..., klipy.com/gifs/..., imgur.com/...), достаём медиа из Open Graph
     try {
-      const resolved = await this._scrapeOpenGraphMedia(url);
-      if (resolved) return resolved;
+      const { buffer } = await this.fetchMediaBuffer(url);
+      const sniffed = sniffMedia(buffer);
+      if (sniffed?.type) return { src: url, type: sniffed.type };
+      if (sniffed?.html) {
+        const fromPage = this._extractOpenGraphMedia(sniffed.html, url);
+        if (fromPage) return fromPage;
+      }
     } catch (e) {
-      console.warn("Scene Shitposts | Не удалось распарсить страницу напрямую:", e);
+      console.warn("Scene Shitposts | Не удалось определить тип ссылки:", url, e);
     }
 
     return { src: url, type: "image" };
   }
 
-  static async _scrapeOpenGraphMedia(pageUrl) {
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(pageUrl)}`;
-    const response = await fetch(proxyUrl);
-    if (!response.ok) return null;
-    const data = await response.json();
-    const html = data.contents;
-    if (!html) return null;
+  /**
+   * Приводит ссылку к прямому адресу файла без сетевых запросов
+   */
+  static normalize(rawUrl) {
+    const url = String(rawUrl ?? "").trim().split(/\s+/)[0];
 
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, "text/html");
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      // Относительный путь (файл, загруженный в мир) — оставляем как есть
+      return url;
+    }
+    const host = parsed.hostname.toLowerCase();
 
-    const ogVideo =
-      doc.querySelector('meta[property="og:video:secure_url"]')?.content ||
-      doc.querySelector('meta[property="og:video:url"]')?.content ||
-      doc.querySelector('meta[property="og:video"]')?.content;
-
-    if (ogVideo && /\.(mp4|webm)(\?.*)?$/i.test(ogVideo)) {
-      return { src: ogVideo, type: "video" };
+    // 1. Внешний прокси Дискорда: images-ext-1.discordapp.net/external/<hash>/[%3Fquery/]https/host/path?width=...
+    if (/(^|\.)discordapp\.net$/.test(host) && parsed.pathname.startsWith("/external/")) {
+      const inner = this._unwrapDiscordExternal(parsed);
+      if (inner) return this.normalize(inner);
     }
 
-    const ogImage =
-      doc.querySelector('meta[property="og:image:secure_url"]')?.content ||
-      doc.querySelector('meta[property="og:image"]')?.content ||
-      doc.querySelector('meta[name="twitter:image"]')?.content;
+    // 2. Вложения Discord через media-прокси -> cdn.discordapp.com (оригинал без пережатия, открыт CORS).
+    // Параметры подписи ex/is/hm сохраняются, параметры ресайза удаляются — они ломают анимацию
+    if (host === "media.discordapp.net" && /^\/(attachments|ephemeral-attachments)\//.test(parsed.pathname)) {
+      parsed.hostname = "cdn.discordapp.com";
+      for (const key of ["width", "height", "format", "quality", ""]) parsed.searchParams.delete(key);
+      return parsed.toString();
+    }
 
+    // 3. Imgur .gifv — это HTML-обёртка, сам файл лежит рядом как .mp4
+    if (host === "i.imgur.com" && /\.gifv$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/\.gifv$/i, ".mp4");
+      return parsed.toString();
+    }
+
+    // 4. Страницы Giphy: giphy.com/gifs/<slug>-<id>, giphy.com/embed/<id>, giphy.com/stickers/<slug>-<id>
+    if ((host === "giphy.com" || host === "www.giphy.com")) {
+      const match = parsed.pathname.match(/^\/(gifs|embed|stickers)\/(?:[^/]*-)?([A-Za-z0-9]+)\/?$/);
+      if (match) {
+        // У стикеров прозрачный фон, которого нет в MP4, поэтому для них берём GIF
+        const file = match[1] === "stickers" ? "giphy.gif" : "giphy.mp4";
+        return `https://media.giphy.com/media/${match[2]}/${file}`;
+      }
+    }
+
+    return parsed.toString();
+  }
+
+  static _unwrapDiscordExternal(parsed) {
+    try {
+      // ["", "external", "<hash>", ...]
+      const segments = parsed.pathname.split("/").slice(3);
+      let query = "";
+      while (segments.length && !/^https?$/i.test(segments[0])) {
+        const segment = decodeURIComponent(segments.shift());
+        if (segment.startsWith("?")) query = segment;
+      }
+      if (segments.length < 2) return null;
+      const protocol = segments.shift().toLowerCase();
+      return `${protocol}://${segments.join("/")}${query}`;
+    } catch {
+      return null;
+    }
+  }
+
+  static _extension(url) {
+    let path;
+    try {
+      path = new URL(url, window.location.href).pathname;
+    } catch {
+      path = url.split(/[?#]/)[0];
+    }
+    const dot = path.lastIndexOf(".");
+    if (dot === -1 || dot < path.lastIndexOf("/")) return null;
+    return path.slice(dot + 1).toLowerCase();
+  }
+
+  static typeFromExtension(url) {
+    const ext = this._extension(url);
+    if (VIDEO_EXTENSIONS.has(ext)) return "video";
+    if (IMAGE_EXTENSIONS.has(ext)) return "image";
+    return null;
+  }
+
+  /**
+   * true, если по ссылке может лежать анимация (или неизвестно, что там лежит)
+   */
+  static mayBeAnimated(url) {
+    const ext = this._extension(this.normalize(url));
+    return !STATIC_EXTENSIONS.has(ext) && ext !== "png";
+  }
+
+  static isRemote(url) {
+    try {
+      return new URL(url, window.location.href).origin !== window.location.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  static _extractOpenGraphMedia(html, pageUrl) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const meta = (...selectors) => {
+      for (const selector of selectors) {
+        const content = doc.querySelector(selector)?.getAttribute("content");
+        if (content) {
+          try {
+            return new URL(content, pageUrl).toString();
+          } catch {
+            // Битая ссылка в meta — пробуем следующую
+          }
+        }
+      }
+      return null;
+    };
+
+    const ogVideo = meta(
+      'meta[property="og:video:secure_url"]',
+      'meta[property="og:video:url"]',
+      'meta[property="og:video"]',
+      'meta[name="twitter:player:stream"]'
+    );
+    const ogVideoType = doc.querySelector('meta[property="og:video:type"]')?.getAttribute("content") || "";
+    // og:video бывает ссылкой на HTML-плеер (YouTube и т. п.), берём только прямые файлы
+    if (ogVideo && (this.typeFromExtension(ogVideo) === "video" || ogVideoType.startsWith("video/"))) {
+      return { src: this.normalize(ogVideo), type: "video" };
+    }
+
+    const ogImage = meta(
+      'meta[property="og:image:secure_url"]',
+      'meta[property="og:image"]',
+      'meta[name="twitter:image"]'
+    );
     if (ogImage) {
-      if (/\.(mp4|webm)(\?.*)?$/i.test(ogImage)) return { src: ogImage, type: "video" };
-      if (/\.gif(\?.*)?$/i.test(ogImage)) return { src: ogImage, type: "gif" };
-      return { src: ogImage, type: "image" };
+      const src = this.normalize(ogImage);
+      return { src, type: this.typeFromExtension(src) || "image" };
     }
 
     return null;
@@ -94,37 +266,42 @@ class MediaUrlResolver {
   /**
    * Скачивает бинарные данные картинки/гифки с умным обходом CORS
    */
-  static async fetchMediaBuffer(src) {
-    // Попытка 1: Прямой запрос (работает для cdn.discordapp.com, tenor, giphy и локальных файлов)
+  static fetchMediaBuffer(src) {
+    const cached = this._bufferCache.get(src);
+    if (cached) return cached;
+
+    const promise = this._downloadBuffer(src);
+    this._bufferCache.set(src, promise);
+    promise.then(
+      () => setTimeout(() => this._bufferCache.delete(src), 60_000),
+      () => this._bufferCache.delete(src)
+    );
+    return promise;
+  }
+
+  static async _downloadBuffer(src) {
+    const read = async (res) => ({
+      buffer: await res.arrayBuffer(),
+      contentType: res.headers.get("content-type") || ""
+    });
+
+    // Попытка 1: Прямой запрос (работает для файлов мира, cdn.discordapp.com, media.giphy.com и других хостингов с CORS)
     try {
-      const res = await fetch(src, { mode: "cors", credentials: "omit" });
-      if (res.ok) {
-        return {
-          buffer: await res.arrayBuffer(),
-          contentType: res.headers.get("content-type") || "image/gif"
-        };
-      }
+      const res = await fetch(src, { mode: "cors", credentials: this.isRemote(src) ? "omit" : "same-origin" });
+      if (res.ok) return await read(res);
     } catch {
       // Переходим к запасному прокси
     }
 
     // Попытка 2: Через резервные CORS-прокси (правильно кодируя URL со всеми амперсандами)
-    const proxies = [
-      `https://corsproxy.io/?url=${encodeURIComponent(src)}`,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(src)}`
-    ];
-
-    for (const proxyUrl of proxies) {
-      try {
-        const res = await fetch(proxyUrl);
-        if (res.ok) {
-          return {
-            buffer: await res.arrayBuffer(),
-            contentType: res.headers.get("content-type") || "image/gif"
-          };
+    if (this.isRemote(src)) {
+      for (const makeProxyUrl of CORS_PROXIES) {
+        try {
+          const res = await fetch(makeProxyUrl(src), { credentials: "omit" });
+          if (res.ok) return await read(res);
+        } catch {
+          // Пробуем следующий прокси
         }
-      } catch {
-        // Пробуем следующий прокси
       }
     }
 
@@ -145,8 +322,10 @@ class ShitpostNode extends PIXI.Container {
     this.isResizing = false;
     this.resizeHandle = null;
     this.videoElement = null;
-    this.gifTimer = null;
-    this.gifFrames = [];
+    this.animation = null;
+    this.ownedTextures = [];
+    this.objectUrl = null;
+    this.loadToken = 0;
 
     this.position.set(this.data.x, this.data.y);
     this.eventMode = "static";
@@ -178,173 +357,215 @@ class ShitpostNode extends PIXI.Container {
     this.loadingSpinner.endFill();
   }
 
-  async _loadMedia() {
-    const resolved = await MediaUrlResolver.resolve(this.data.src);
-    if (this.destroyed) return;
+  _isStale(token) {
+    return this.destroyed || token !== this.loadToken;
+  }
 
-    const src = resolved.src;
-    const type = resolved.type;
+  async _loadMedia() {
+    const token = ++this.loadToken;
+    const { src, type } = await MediaUrlResolver.resolve(this.data.src);
+    if (this._isStale(token)) return;
 
     if (type === "video") {
-      await this._loadVideoMedia(src);
-    } else if (type === "gif") {
-      await this._loadAnimatedGif(src);
+      await this._loadVideoMedia(src, token);
     } else {
-      await this._loadStaticImage(src);
+      // Сюда же попадают старые посты с type "gif"
+      await this._loadImageMedia(src, token);
     }
   }
 
-  async _loadVideoMedia(src) {
+  async _loadVideoMedia(src, token) {
     try {
-      const video = document.createElement("video");
-      video.crossOrigin = "anonymous";
-      video.muted = true;
-      video.loop = true;
-      video.autoplay = true;
-      video.playsInline = true;
-      video.preload = "auto";
-      video.src = src;
+      await this._playVideo(src, MediaUrlResolver.isRemote(src), token);
+    } catch (err) {
+      if (this._isStale(token)) return;
+      // Хостинг без CORS: WebGL не может взять кадры такого видео, поэтому скачиваем его целиком и играем из Blob
+      try {
+        if (!MediaUrlResolver.isRemote(src)) throw err;
+        const { buffer, contentType } = await MediaUrlResolver.fetchMediaBuffer(src);
+        if (this._isStale(token)) return;
+        const mime = sniffMedia(buffer)?.mime || contentType.split(";")[0].trim() || "video/mp4";
+        await this._playVideo(this._createObjectUrl(buffer, mime), false, token);
+      } catch (fallbackErr) {
+        console.error("Scene Shitposts | Ошибка загрузки видео:", src, err, fallbackErr);
+        this._showErrorState(token);
+      }
+    }
+  }
 
-      this.videoElement = video;
+  async _playVideo(url, useCors, token) {
+    const video = document.createElement("video");
+    if (useCors) video.crossOrigin = "anonymous";
+    video.muted = true;
+    video.loop = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = url;
 
-      await new Promise((resolve, reject) => {
-        const onReady = () => {
-          cleanup();
-          resolve();
-        };
-        const onError = (err) => {
-          cleanup();
-          reject(err);
-        };
-        const cleanup = () => {
-          video.removeEventListener("loadeddata", onReady);
-          video.removeEventListener("canplay", onReady);
-          video.removeEventListener("error", onError);
-        };
-        video.addEventListener("loadeddata", onReady, { once: true });
-        video.addEventListener("canplay", onReady, { once: true });
-        video.addEventListener("error", onError, { once: true });
-        video.load();
-      });
+    await new Promise((resolve, reject) => {
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(video.error ?? new Error(`Видео не загрузилось: ${url}`));
+      };
+      const cleanup = () => {
+        video.removeEventListener("loadeddata", onReady);
+        video.removeEventListener("error", onError);
+      };
+      video.addEventListener("loadeddata", onReady);
+      video.addEventListener("error", onError);
+      video.load();
+    });
 
-      if (this.destroyed) return;
+    if (this._isStale(token)) {
+      video.removeAttribute("src");
+      video.load();
+      return;
+    }
 
-      const tex = PIXI.Texture.from(video, {
-        resourceOptions: { autoPlay: true, updateFPS: 0 }
-      });
+    this.videoElement = video;
+    const tex = PIXI.Texture.from(video, {
+      resourceOptions: { autoPlay: true, updateFPS: 0 }
+    });
+    if (tex.baseTexture?.resource) {
+      tex.baseTexture.resource.autoUpdate = true;
+    }
+    this._showTexture(tex, true);
+    this._applyInitialDimensions(video.videoWidth || 300, video.videoHeight || 300);
 
-      if (tex.baseTexture?.resource) {
-        tex.baseTexture.resource.autoUpdate = true;
+    // Отказ автозапуска не ошибка загрузки: первый кадр уже на холсте
+    video.play().catch(err => console.warn("Scene Shitposts | Браузер не дал запустить видео:", err));
+  }
+
+  async _loadImageMedia(src, token) {
+    let buffer;
+    let mime;
+    try {
+      const res = await MediaUrlResolver.fetchMediaBuffer(src);
+      buffer = res.buffer;
+      mime = sniffMedia(buffer)?.mime || res.contentType.split(";")[0].trim() || "image/png";
+    } catch {
+      // Если совсем не вышло через fetch, пробуем нативный загрузчик Foundry
+      await this._loadViaFoundry(src, token);
+      return;
+    }
+    if (this._isStale(token)) return;
+
+    // Ссылка с расширением .gif, внутри которой на самом деле MP4/WebM
+    if (mime.startsWith("video/")) {
+      try {
+        await this._playVideo(this._createObjectUrl(buffer, mime), false, token);
+      } catch (err) {
+        console.error("Scene Shitposts | Ошибка загрузки видео:", src, err);
+        this._showErrorState(token);
+      }
+      return;
+    }
+
+    try {
+      if (await this._playAnimated(buffer, mime, token)) return;
+    } catch (err) {
+      console.warn("Scene Shitposts | ImageDecoder не смог декодировать анимацию, открываем как статику:", src, err);
+    }
+    if (this._isStale(token)) return;
+
+    try {
+      await this._loadFromBuffer(buffer, mime, token);
+    } catch {
+      await this._loadViaFoundry(src, token);
+    }
+  }
+
+  /**
+   * Проигрывает анимированный GIF / WebP / APNG / AVIF. Кадры декодируются по одному
+   * в один и тот же canvas, поэтому длинные гифки не забивают память видеокарты.
+   * Возвращает false, если файл не анимирован или браузер не умеет его декодировать.
+   */
+  async _playAnimated(buffer, mime, token) {
+    if (!ANIMATABLE_MIMES.has(mime) || typeof ImageDecoder === "undefined") return false;
+    if (!(await ImageDecoder.isTypeSupported(mime))) return false;
+
+    const decoder = new ImageDecoder({ data: buffer, type: mime });
+    try {
+      await decoder.tracks.ready;
+      // Количество кадров окончательное только после разбора всего файла
+      await decoder.completed;
+      const frameCount = decoder.tracks.selectedTrack?.frameCount ?? 0;
+      if (frameCount < 2 || this._isStale(token)) {
+        decoder.close();
+        return false;
       }
 
-      this.mediaSprite.texture = tex;
-      this.mediaSprite.visible = true;
-      this.loadingSpinner.visible = false;
+      const first = (await decoder.decode({ frameIndex: 0 })).image;
+      const frameCanvas = document.createElement("canvas");
+      frameCanvas.width = first.displayWidth;
+      frameCanvas.height = first.displayHeight;
+      const ctx = frameCanvas.getContext("2d");
+      ctx.drawImage(first, 0, 0);
+      const firstDelay = this._frameDelay(first);
+      first.close();
 
-      this._applyInitialDimensions(video.videoWidth || 300, video.videoHeight || 300);
-      await video.play();
-    } catch (err) {
-      console.error("Scene Shitposts | Ошибка загрузки видео:", src, err);
-      this._showErrorState();
-    }
-  }
+      if (this._isStale(token)) {
+        decoder.close();
+        return true;
+      }
 
-  async _loadAnimatedGif(src) {
-    try {
-      const { buffer, contentType } = await MediaUrlResolver.fetchMediaBuffer(src);
-      if (this.destroyed) return;
+      const tex = PIXI.Texture.from(frameCanvas);
+      this.animation = { decoder, timer: null, closed: false };
+      this._showTexture(tex, true);
+      this._applyInitialDimensions(frameCanvas.width, frameCanvas.height);
 
-      // Определяем реальный MIME-тип (иногда файл называется .gif, но внутри лежат байты PNG/WebP или наоборот)
-      const mime = this._detectMimeFromBytes(buffer) || contentType.split(";")[0].trim() || "image/gif";
-
-      // 1. Если есть ImageDecoder и это многокадровая анимация (GIF или анимированный WebP)
-      if ("ImageDecoder" in window && (mime === "image/gif" || mime === "image/webp")) {
+      const animation = this.animation;
+      let frameIndex = 0;
+      const playNextFrame = async () => {
+        if (animation.closed) return;
+        const started = performance.now();
+        frameIndex = (frameIndex + 1) % frameCount;
+        let delay = 100;
         try {
-          const decoder = new ImageDecoder({ data: buffer.slice(0), type: mime });
-          await decoder.tracks.ready;
-          const frameCount = decoder.tracks.selectedTrack.frameCount;
-
-          if (frameCount > 1) {
-            let firstW = 300;
-            let firstH = 300;
-
-            for (let i = 0; i < frameCount; i++) {
-              if (this.destroyed) return;
-              const result = await decoder.decode({ frameIndex: i });
-              const frame = result.image;
-              if (i === 0) {
-                firstW = frame.displayWidth;
-                firstH = frame.displayHeight;
-              }
-
-              const offCanvas = document.createElement("canvas");
-              offCanvas.width = frame.displayWidth;
-              offCanvas.height = frame.displayHeight;
-              const ctx = offCanvas.getContext("2d");
-              ctx.drawImage(frame, 0, 0);
-
-              const durationMs = Math.max(20, (frame.duration || 100000) / 1000);
-              this.gifFrames.push({
-                texture: PIXI.Texture.from(offCanvas),
-                duration: durationMs
-              });
-              frame.close();
-            }
-
-            if (this.destroyed || this.gifFrames.length === 0) return;
-
-            this.mediaSprite.texture = this.gifFrames[0].texture;
-            this.mediaSprite.visible = true;
-            this.loadingSpinner.visible = false;
-            this._applyInitialDimensions(firstW, firstH);
-
-            let currentFrame = 0;
-            const playNextFrame = () => {
-              if (this.destroyed || this.gifFrames.length === 0) return;
-              this.mediaSprite.texture = this.gifFrames[currentFrame].texture;
-              const delay = this.gifFrames[currentFrame].duration;
-              currentFrame = (currentFrame + 1) % this.gifFrames.length;
-              this.gifTimer = setTimeout(playNextFrame, delay);
-            };
-            playNextFrame();
+          const frame = (await decoder.decode({ frameIndex })).image;
+          if (animation.closed) {
+            frame.close();
             return;
           }
-        } catch (decodeErr) {
-          console.warn("Scene Shitposts | ImageDecoder не смог декодировать как многокадровый, открываем как статику:", decodeErr);
+          // ImageDecoder отдаёт уже собранные полные кадры, поэтому старый кадр просто затираем
+          ctx.clearRect(0, 0, frameCanvas.width, frameCanvas.height);
+          ctx.drawImage(frame, 0, 0);
+          delay = this._frameDelay(frame);
+          frame.close();
+          tex.baseTexture.update();
+        } catch (err) {
+          if (animation.closed) return;
+          console.warn("Scene Shitposts | Ошибка декодирования кадра:", err);
         }
-      }
-
-      // 2. Если это статичный (1-кадровый) .gif или картинка с расширением .gif —
-      // создаём текстуру напрямую из уже скачанного буфера (Blob URL), чтобы не зависеть от CORS!
-      await this._loadFromBuffer(buffer, mime);
+        animation.timer = setTimeout(playNextFrame, Math.max(0, delay - (performance.now() - started)));
+      };
+      animation.timer = setTimeout(playNextFrame, firstDelay);
+      return true;
     } catch (err) {
-      console.warn("Scene Shitposts | Fallback на прямую загрузку для:", src, err);
-      await this._loadStaticImage(src);
+      decoder.close();
+      throw err;
     }
   }
 
-  _detectMimeFromBytes(buffer) {
-    const arr = new Uint8Array(buffer).subarray(0, 12);
-    if (arr.length < 4) return null;
-    // GIF87a / GIF89a: 47 49 46 38
-    if (arr[0] === 0x47 && arr[1] === 0x49 && arr[2] === 0x46 && arr[3] === 0x38) return "image/gif";
-    // PNG: 89 50 4E 47
-    if (arr[0] === 0x89 && arr[1] === 0x50 && arr[2] === 0x4e && arr[3] === 0x47) return "image/png";
-    // JPEG: FF D8 FF
-    if (arr[0] === 0xff && arr[1] === 0xd8 && arr[2] === 0xff) return "image/jpeg";
-    // WEBP: RIFF....WEBP
-    if (
-      arr[0] === 0x52 && arr[1] === 0x49 && arr[2] === 0x46 && arr[3] === 0x46 &&
-      arr[8] === 0x57 && arr[9] === 0x45 && arr[10] === 0x42 && arr[11] === 0x50
-    ) {
-      return "image/webp";
-    }
-    return null;
+  _frameDelay(frame) {
+    // duration в микросекундах. Браузеры показывают кадры с задержкой <= 10 мс как 100 мс, повторяем это поведение
+    const ms = (frame.duration ?? 0) / 1000;
+    return ms <= 10 ? 100 : ms;
   }
 
-  async _loadFromBuffer(buffer, mime) {
-    const blob = new Blob([buffer], { type: mime });
-    const objectUrl = URL.createObjectURL(blob);
+  _createObjectUrl(buffer, mime) {
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    this.objectUrl = URL.createObjectURL(new Blob([buffer], { type: mime }));
+    return this.objectUrl;
+  }
+
+  async _loadFromBuffer(buffer, mime, token) {
+    const objectUrl = URL.createObjectURL(new Blob([buffer], { type: mime }));
     try {
       const img = await new Promise((resolve, reject) => {
         const image = new Image();
@@ -352,49 +573,43 @@ class ShitpostNode extends PIXI.Container {
         image.onerror = reject;
         image.src = objectUrl;
       });
-      if (this.destroyed) return;
-      const tex = PIXI.Texture.from(img);
-      this.mediaSprite.texture = tex;
-      this.mediaSprite.visible = true;
-      this.loadingSpinner.visible = false;
+      await img.decode?.().catch(() => {});
+      if (this._isStale(token)) return;
+      this._showTexture(PIXI.Texture.from(img), true);
       this._applyInitialDimensions(img.naturalWidth || 300, img.naturalHeight || 300);
     } finally {
       URL.revokeObjectURL(objectUrl);
     }
   }
 
-  async _loadStaticImage(src) {
+  async _loadViaFoundry(src, token) {
     try {
-      // Сначала пробуем скачать буфер (чтобы обойти возможный CORS на внешних хостингах)
-      const { buffer, contentType } = await MediaUrlResolver.fetchMediaBuffer(src);
-      if (this.destroyed) return;
-      const mime = this._detectMimeFromBytes(buffer) || contentType.split(";")[0].trim() || "image/png";
-      await this._loadFromBuffer(buffer, mime);
-    } catch {
-      // Если совсем не вышло через fetch, пробуем нативный загрузчик Foundry
-      try {
-        const loadTex = foundry?.canvas?.loadTexture || loadTexture;
-        let tex = await loadTex(src);
-        if (this.destroyed || !tex) return;
-
-        this.mediaSprite.texture = tex;
-        this.mediaSprite.visible = true;
-        this.loadingSpinner.visible = false;
-        this._applyInitialDimensions(tex.width || 300, tex.height || 300);
-      } catch (err) {
-        console.error("Scene Shitposts | Не удалось загрузить изображение:", src, err);
-        this._showErrorState();
-      }
+      const tex = await Compat.loadTexture(src);
+      if (this._isStale(token) || !tex) return;
+      // Текстуры из кеша Foundry общие, их не уничтожаем
+      this._showTexture(tex, false);
+      this._applyInitialDimensions(tex.width || 300, tex.height || 300);
+    } catch (err) {
+      console.error("Scene Shitposts | Не удалось загрузить изображение:", src, err);
+      this._showErrorState(token);
     }
   }
 
-  _showErrorState() {
-    if (this.destroyed) return;
+  _showTexture(tex, owned) {
+    if (owned) this.ownedTextures.push(tex);
+    this.mediaSprite.texture = tex;
+    this.mediaSprite.visible = true;
+    this.loadingSpinner.visible = false;
+  }
+
+  _showErrorState(token) {
+    if (this._isStale(token)) return;
     this.loadingSpinner.clear();
     this.loadingSpinner.beginFill(0x550000, 0.7);
     this.loadingSpinner.lineStyle(2, 0xff4444, 1);
     this.loadingSpinner.drawRoundedRect(-60, -60, 120, 120, 12);
     this.loadingSpinner.endFill();
+    this.loadingSpinner.visible = true;
   }
 
   _applyInitialDimensions(natWidth, natHeight) {
@@ -413,13 +628,22 @@ class ShitpostNode extends PIXI.Container {
       }
       this.data.width = Math.max(40, w);
       this.data.height = Math.max(40, h);
-      ShitpostManager.updatePost({
-        id: this.data.id,
-        width: this.data.width,
-        height: this.data.height
-      });
+      // Размер сохраняет один клиент (автор или активный ГМ), а не каждый, кто загрузил пост
+      if (this._isSizeOwner()) {
+        ShitpostManager.updatePost({
+          id: this.data.id,
+          width: this.data.width,
+          height: this.data.height
+        });
+      }
     }
     this.refreshVisuals();
+  }
+
+  _isSizeOwner() {
+    const author = game.users.get(this.data.authorId);
+    if (author?.active) return author.isSelf;
+    return game.users.activeGM?.isSelf ?? false;
   }
 
   _createHandles() {
@@ -576,6 +800,9 @@ class ShitpostNode extends PIXI.Container {
     this.data = foundry.utils.deepClone(newData);
     if (srcChanged) {
       this._cleanupMedia();
+      this._drawLoadingPlaceholder();
+      this.loadingSpinner.visible = true;
+      this.refreshVisuals();
       this._loadMedia();
     } else if (!this.isDragging && !this.isResizing) {
       this.refreshVisuals();
@@ -583,21 +810,36 @@ class ShitpostNode extends PIXI.Container {
   }
 
   _cleanupMedia() {
-    if (this.gifTimer) {
-      clearTimeout(this.gifTimer);
-      this.gifTimer = null;
-    }
-    if (this.gifFrames.length > 0) {
-      for (const frame of this.gifFrames) {
-        frame.texture.destroy(true);
+    // Отменяет загрузки, которые ещё не завершились
+    this.loadToken++;
+
+    if (this.animation) {
+      this.animation.closed = true;
+      clearTimeout(this.animation.timer);
+      try {
+        this.animation.decoder.close();
+      } catch {
+        // Декодер уже закрыт
       }
-      this.gifFrames = [];
+      this.animation = null;
     }
     if (this.videoElement) {
       this.videoElement.pause();
       this.videoElement.removeAttribute("src");
       this.videoElement.load();
       this.videoElement = null;
+    }
+    if (this.mediaSprite && !this.mediaSprite.destroyed) {
+      this.mediaSprite.texture = PIXI.Texture.EMPTY;
+      this.mediaSprite.visible = false;
+    }
+    for (const tex of this.ownedTextures) {
+      tex.destroy(true);
+    }
+    this.ownedTextures = [];
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = null;
     }
   }
 
@@ -762,9 +1004,10 @@ class ShitpostManager {
   static async addPost(postData) {
     if (!canvas.scene) return;
 
-    const resolved = postData.type
-      ? { src: postData.src, type: postData.type }
-      : await MediaUrlResolver.resolve(postData.src);
+    const isFreshLink = !postData.type;
+    const resolved = isFreshLink
+      ? await MediaUrlResolver.resolve(postData.src)
+      : { src: postData.src, type: postData.type };
 
     const newPost = {
       id: foundry.utils.randomID(),
@@ -777,11 +1020,61 @@ class ShitpostManager {
       authorId: game.user.id
     };
 
+    // Новую внешнюю ссылку сохраняем в папку мира: все клиенты грузят её с сервера Foundry,
+    // без CORS-прокси, а протухшие ссылки Discord продолжают работать
+    if (isFreshLink && this.shouldCacheRemote(newPost.src)) {
+      if (this.canUpload()) {
+        const cached = await this.cacheRemoteMedia(newPost.src);
+        if (cached) Object.assign(newPost, cached);
+      } else {
+        game.socket.emit(SOCKET_NAME, { action: "CACHE_AND_ADD", sceneId: canvas.scene.id, post: newPost });
+        return;
+      }
+    }
+
     if (game.user.isGM) {
       await this._gmAddPost(canvas.scene.id, newPost);
     } else {
       game.socket.emit(SOCKET_NAME, { action: "ADD_POST", sceneId: canvas.scene.id, post: newPost });
     }
+  }
+
+  static canUpload() {
+    return game.user.isGM || game.user.can("FILES_UPLOAD");
+  }
+
+  static shouldCacheRemote(src) {
+    return game.settings.get(MODULE_ID, "cacheRemoteMedia") && MediaUrlResolver.isRemote(src);
+  }
+
+  /**
+   * Скачивает внешний файл и загружает его в папку мира.
+   * Возвращает { src, type } с локальным путём или null, если сохранить не вышло.
+   */
+  static async cacheRemoteMedia(src) {
+    try {
+      const { buffer, contentType } = await MediaUrlResolver.fetchMediaBuffer(src);
+      if (buffer.byteLength > MAX_CACHE_BYTES) return null;
+      const mime = sniffMedia(buffer)?.mime || contentType.split(";")[0].trim();
+      const ext = MIME_EXTENSIONS[mime];
+      // Не медиа (например, HTML-страница с ошибкой) — оставляем ссылку как есть
+      if (!ext) return null;
+
+      const file = new File([buffer], `url-${hashString(src)}.${ext}`, { type: mime });
+      const path = await this.uploadToWorld(file);
+      if (!path) return null;
+      return { src: path, type: mime.startsWith("video/") ? "video" : "image" };
+    } catch (err) {
+      console.warn("Scene Shitposts | Не удалось сохранить файл на сервер, остаётся внешняя ссылка:", src, err);
+      return null;
+    }
+  }
+
+  static async uploadToWorld(file) {
+    const dirPath = `worlds/${game.world.id}/shitposts`;
+    await this._ensureDirectory(dirPath);
+    const response = await Compat.FilePicker.upload("data", dirPath, file, {}, { notify: false });
+    return response?.path ?? null;
   }
 
   static async updatePost(partialData) {
@@ -835,16 +1128,12 @@ class ShitpostManager {
       const finalBlob = isGif ? blob : await this._convertToWebP(blob);
       const ext = isGif ? "gif" : "webp";
       const fileName = `shitpost-${Date.now()}-${foundry.utils.randomID(4)}.${ext}`;
-      const dirPath = `worlds/${game.world.id}/shitposts`;
-
       const file = new File([finalBlob], fileName, { type: finalBlob.type });
 
-      if (game.user.isGM || game.user.can("FILES_UPLOAD")) {
-        await this._ensureDirectory(dirPath);
-        const PickerClass = foundry?.applications?.apps?.FilePicker?.implementation || FilePicker;
-        const response = await PickerClass.upload("data", dirPath, file, {}, { notify: false });
-        if (response?.path) {
-          await this.addPost({ src: response.path, type: isGif ? "gif" : "image", x: spawnPos.x, y: spawnPos.y });
+      if (this.canUpload()) {
+        const path = await this.uploadToWorld(file);
+        if (path) {
+          await this.addPost({ src: path, type: "image", x: spawnPos.x, y: spawnPos.y });
         }
       } else {
         const base64 = await this._blobToBase64(finalBlob);
@@ -866,9 +1155,8 @@ class ShitpostManager {
   }
 
   static async _ensureDirectory(dirPath) {
-    const PickerClass = foundry?.applications?.apps?.FilePicker?.implementation || FilePicker;
     try {
-      await PickerClass.createDirectory("data", dirPath, {});
+      await Compat.FilePicker.createDirectory("data", dirPath, {});
     } catch {
       // Папка уже есть
     }
@@ -923,37 +1211,63 @@ function isTypingInInput() {
   return false;
 }
 
+function extractClipboardHtmlUrl(clipboard) {
+  const html = clipboard.getData("text/html");
+  if (!html) return null;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const src = doc.querySelector("img[src], video[src], video source[src]")?.getAttribute("src");
+  return src && /^https?:\/\//i.test(src) ? src : null;
+}
+
+Hooks.once("init", () => {
+  game.settings.register(MODULE_ID, "cacheRemoteMedia", {
+    name: "Сохранять внешние картинки на сервер",
+    hint: "Вставленные по ссылке картинки и гифки скачиваются в папку мира (worlds/<мир>/shitposts). Все игроки грузят их с сервера Foundry: не нужны CORS-прокси, и ссылки Discord не протухают. Файлы занимают место на диске сервера.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: true
+  });
+});
+
 Hooks.once("ready", () => {
   game.socket.on(SOCKET_NAME, async (payload) => {
     if (!game.user.isGM) return;
     if (game.users.activeGM?.id !== game.user.id) return;
 
-    if (payload.action === "ADD_POST") {
-      await ShitpostManager._gmAddPost(payload.sceneId, payload.post);
-    } else if (payload.action === "UPDATE_POST") {
-      await ShitpostManager._gmUpdatePost(payload.sceneId, payload.update);
-    } else if (payload.action === "DELETE_POST") {
-      await ShitpostManager._gmDeletePost(payload.sceneId, payload.postId);
-    } else if (payload.action === "UPLOAD_AND_SPAWN") {
-      const res = await fetch(payload.base64);
-      const blob = await res.blob();
-      const dirPath = `worlds/${game.world.id}/shitposts`;
-      await ShitpostManager._ensureDirectory(dirPath);
-      const file = new File([blob], payload.fileName, { type: payload.mimeType || "image/webp" });
-      const PickerClass = foundry?.applications?.apps?.FilePicker?.implementation || FilePicker;
-      const uploadRes = await PickerClass.upload("data", dirPath, file, {}, { notify: false });
-      if (uploadRes?.path) {
-        await ShitpostManager._gmAddPost(payload.sceneId, {
-          id: foundry.utils.randomID(),
-          src: uploadRes.path,
-          type: payload.fileName.endsWith(".gif") ? "gif" : "image",
-          x: payload.x,
-          y: payload.y,
-          width: null,
-          height: null,
-          authorId: payload.authorId
-        });
+    try {
+      if (payload.action === "ADD_POST") {
+        await ShitpostManager._gmAddPost(payload.sceneId, payload.post);
+      } else if (payload.action === "UPDATE_POST") {
+        await ShitpostManager._gmUpdatePost(payload.sceneId, payload.update);
+      } else if (payload.action === "DELETE_POST") {
+        await ShitpostManager._gmDeletePost(payload.sceneId, payload.postId);
+      } else if (payload.action === "CACHE_AND_ADD") {
+        // У игрока нет права загружать файлы: ГМ сам скачивает ссылку и сохраняет её в мир
+        const post = payload.post;
+        const cached = await ShitpostManager.cacheRemoteMedia(post.src);
+        if (cached) Object.assign(post, cached);
+        await ShitpostManager._gmAddPost(payload.sceneId, post);
+      } else if (payload.action === "UPLOAD_AND_SPAWN") {
+        const res = await fetch(payload.base64);
+        const blob = await res.blob();
+        const file = new File([blob], payload.fileName, { type: payload.mimeType || "image/webp" });
+        const path = await ShitpostManager.uploadToWorld(file);
+        if (path) {
+          await ShitpostManager._gmAddPost(payload.sceneId, {
+            id: foundry.utils.randomID(),
+            src: path,
+            type: "image",
+            x: payload.x,
+            y: payload.y,
+            width: null,
+            height: null,
+            authorId: payload.authorId
+          });
+        }
       }
+    } catch (err) {
+      console.error(`Scene Shitposts | Ошибка обработки запроса ${payload.action}:`, err);
     }
   });
 
@@ -1026,6 +1340,17 @@ Hooks.once("ready", () => {
       }
     }
 
+    // «Копировать картинку» в браузере и Discord кладёт в буфер только первый кадр гифки (PNG),
+    // а рядом — HTML с исходной ссылкой. По ссылке анимация сохраняется
+    const htmlUrl = extractClipboardHtmlUrl(clipboard);
+    if (htmlUrl && MediaUrlResolver.mayBeAnimated(htmlUrl)) {
+      e.preventDefault();
+      e.stopPropagation();
+      ShitpostManager.isInternalClipboardActive = false;
+      await ShitpostManager.addPost({ src: htmlUrl, x: pos.x, y: pos.y });
+      return;
+    }
+
     if (clipboard?.items) {
       for (const item of clipboard.items) {
         if (item.type.startsWith("image/")) {
@@ -1041,12 +1366,13 @@ Hooks.once("ready", () => {
       }
     }
 
-    if (text && /^https?:\/\/\S+/i.test(text)) {
+    const linkMatch = text.match(/^https?:\/\/\S+/i);
+    if (linkMatch) {
       e.preventDefault();
       e.stopPropagation();
       ShitpostManager.isInternalClipboardActive = false;
       await ShitpostManager.addPost({
-        src: text,
+        src: linkMatch[0],
         x: pos.x,
         y: pos.y
       });
